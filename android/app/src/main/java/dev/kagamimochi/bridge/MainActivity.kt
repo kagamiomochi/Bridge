@@ -87,7 +87,10 @@ class MainActivity : Activity() {
         }
         val stop = Button(this).apply {
             text = "Stop"
-            setOnClickListener { stopService(Intent(this@MainActivity, SyncService::class.java)) }
+            setOnClickListener {
+                Config.setServiceEnabled(this@MainActivity, false)
+                stopService(Intent(this@MainActivity, SyncService::class.java))
+            }
         }
 
         listOf(status, host, pair, grant, start, stop).forEach { root.addView(it) }
@@ -158,6 +161,7 @@ class MainActivity : Activity() {
     }
 
     private fun restartService() {
+        Config.setServiceEnabled(this, true)
         stopService(Intent(this, SyncService::class.java))
         startForegroundService(Intent(this, SyncService::class.java))
     }
@@ -173,6 +177,7 @@ class MainActivity : Activity() {
             "Shizuku: $shizuku\n" +
             "Shizuku service: ${if (Status.shizukuServiceBound) "bound" else "not bound"}\n" +
             "Connection: ${Status.connection}\n" +
+            "Next retry: ${Status.retry.ifEmpty { "-" }}\n" +
             "Last event: ${Status.lastEvent}"
     }
 

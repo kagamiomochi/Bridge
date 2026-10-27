@@ -10,6 +10,7 @@ object Status {
     @Volatile var connection = "stopped"
     @Volatile var shizukuServiceBound = false
     @Volatile var lastEvent = "-"
+    @Volatile var retry = ""
 
     fun event(message: String) {
         val time = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())

@@ -21,6 +21,13 @@ data class Config(val host: String, val pairing: Pairing?) {
             return Config(p.getString("host", "") ?: "", pairing)
         }
 
+        /** False after the user pressed Stop; the boot receiver respects it. Defaults to true. */
+        fun isServiceEnabled(c: Context): Boolean = prefs(c).getBoolean("service_enabled", true)
+
+        fun setServiceEnabled(c: Context, enabled: Boolean) {
+            prefs(c).edit().putBoolean("service_enabled", enabled).apply()
+        }
+
         fun saveHost(c: Context, host: String) {
             prefs(c).edit().putString("host", host).apply()
         }

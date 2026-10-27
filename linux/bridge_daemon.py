@@ -88,24 +88,30 @@ def local_ip() -> str:
         s.close()
 
 
+def make_service_info(port: int, fp: str):
+    from zeroconf import ServiceInfo
+
+    host = socket.gethostname().split(".")[0]
+    return ServiceInfo(
+        MDNS_TYPE,
+        f"{host}.{MDNS_TYPE}",
+        addresses=[socket.inet_aton(local_ip())],
+        port=port,
+        properties={"v": "1", "fp": fp[:16]},  # fp prefix lets the phone pick the right host
+        server=f"{host}.local.",
+    )
+
+
 async def advertise(port: int, fp: str):
     """Announce the service over mDNS. Returns the zeroconf instance or None."""
     try:
-        from zeroconf import IPVersion, ServiceInfo
+        from zeroconf import IPVersion
         from zeroconf.asyncio import AsyncZeroconf
     except ImportError:
         log.warning("python-zeroconf is not installed: mDNS discovery is disabled")
         return None
     try:
-        host = socket.gethostname().split(".")[0]
-        info = ServiceInfo(
-            MDNS_TYPE,
-            f"{host}.{MDNS_TYPE}",
-            addresses=[socket.inet_aton(local_ip())],
-            port=port,
-            properties={"v": "1", "fp": fp[:16]},  # fp prefix lets the phone pick the right host
-            server=f"{host}.local.",
-        )
+        info = make_service_info(port, fp)
         zc = AsyncZeroconf(ip_version=IPVersion.V4Only)
         await zc.async_register_service(info)
         log.info("mDNS: advertising %s on %s:%d", MDNS_TYPE, local_ip(), port)
@@ -113,6 +119,29 @@ async def advertise(port: int, fp: str):
     except Exception as e:  # discovery is optional, never fatal
         log.warning("mDNS advertising failed: %s", e)
         return None
+
+
+async def watch_address(zc, port: int, fp: str, interval: float = 10.0) -> None:
+    """Re-announce the mDNS record when this machine's address changes
+    (Wi-Fi reconnect, DHCP renewal, resume from suspend), so the phone can
+    find the new address when it reconnects."""
+    current = local_ip()
+    offline = current == "127.0.0.1"
+    while True:
+        await asyncio.sleep(interval)
+        ip = local_ip()
+        if ip == "127.0.0.1":  # no route: wait until the network is back
+            offline = True
+            continue
+        if ip == current and not offline:
+            continue
+        try:
+            await zc.async_update_service(make_service_info(port, fp))
+        except Exception as e:  # retried on the next tick
+            log.warning("mDNS re-announce failed: %s", e)
+            continue
+        log.info("mDNS: address is now %s (was %s), re-announced", ip, current)
+        current, offline = ip, False
 
 
 def normalize_code(code: str) -> str:
@@ -481,6 +510,7 @@ async def main() -> None:
     async with websockets.serve(hub.handler, cfg["host"], cfg["port"], ssl=ctx):
         log.info("listening (TLS) on %s:%s", cfg["host"], cfg["port"])
         zc = await advertise(cfg["port"], fp)
+        watcher = asyncio.create_task(watch_address(zc, cfg["port"], fp)) if zc else None
         control = await start_control(hub)
         if not devices.all():
             hub.open_pairing()  # first run: nothing is paired yet
@@ -489,6 +519,8 @@ async def main() -> None:
         try:
             await asyncio.Future()
         finally:
+            if watcher:
+                watcher.cancel()
             control.close()
             control_path().unlink(missing_ok=True)
             if zc:
