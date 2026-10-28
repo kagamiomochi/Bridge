@@ -248,6 +248,7 @@ class SyncService : Service() {
     override fun onDestroy() {
         networkCallback?.let { runCatching { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) } }
         scope.cancel()
+        media.close()
         shizuku.unbind()
         Status.connection = "stopped"
         super.onDestroy()

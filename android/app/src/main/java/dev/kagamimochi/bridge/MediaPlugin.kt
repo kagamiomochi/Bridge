@@ -11,6 +11,7 @@ import android.graphics.drawable.Icon
 import android.media.AudioManager
 import android.media.MediaMetadata
 import android.media.session.MediaController
+import android.media.session.MediaSession
 import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
 import android.os.Handler
@@ -55,6 +56,20 @@ class MediaPlugin(
     private var current: MediaController? = null
     @Volatile private var lastSignature: String? = null
 
+    /**
+     * A media session that stands for the Linux player. With a MediaStyle notification
+     * attached to it, Android shows it in the system media controls (quick settings,
+     * notification shade, lock screen), and headset buttons are routed to it too.
+     */
+    private val session = MediaSession(context, "BridgeLinux").apply {
+        setCallback(object : MediaSession.Callback() {
+            override fun onPlay() = sendControl("play")
+            override fun onPause() = sendControl("pause")
+            override fun onSkipToNext() = sendControl("next")
+            override fun onSkipToPrevious() = sendControl("previous")
+        }, main)
+    }
+
     init {
         nm.createNotificationChannel(
             NotificationChannel(CHANNEL, "Linux media", NotificationManager.IMPORTANCE_LOW)
@@ -94,8 +109,19 @@ class MediaPlugin(
     override fun onDisconnected() {
         job?.cancel()
         sender = null
-        nm.cancel(NOTIFICATION_ID)
+        hideRemote()
         main.post { detach() }
+    }
+
+    /** Releases the media session. Called when the service is destroyed. */
+    fun close() {
+        hideRemote()
+        session.release()
+    }
+
+    private fun hideRemote() {
+        nm.cancel(NOTIFICATION_ID)
+        session.isActive = false
     }
 
     private fun activeSessions(): List<MediaController>? =
@@ -223,7 +249,7 @@ class MediaPlugin(
         val status = data.optString("status", "stopped")
         val title = data.optString("title")
         if (status == "stopped" || title.isEmpty()) {
-            nm.cancel(NOTIFICATION_ID)
+            hideRemote()
             Status.media = "received: nothing playing on Linux"
             return
         }
@@ -232,6 +258,31 @@ class MediaPlugin(
         val album = data.optString("album")
         val text = listOf(artist, album).filter { it.isNotEmpty() }.joinToString(" - ")
         val playing = status == "playing"
+        val duration = data.optLong("duration_ms", 0L)
+        val position = data.optLong("position_ms", 0L)
+
+        // Update the session first: the system media controls are built from it
+        val metadata = MediaMetadata.Builder()
+            .putString(MediaMetadata.METADATA_KEY_TITLE, title)
+            .putString(MediaMetadata.METADATA_KEY_ARTIST, artist)
+            .putString(MediaMetadata.METADATA_KEY_ALBUM, album)
+        if (duration > 0) metadata.putLong(MediaMetadata.METADATA_KEY_DURATION, duration)
+        session.setMetadata(metadata.build())
+        session.setPlaybackState(
+            PlaybackState.Builder()
+                .setActions(
+                    PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or
+                        PlaybackState.ACTION_PLAY_PAUSE or
+                        PlaybackState.ACTION_SKIP_TO_NEXT or PlaybackState.ACTION_SKIP_TO_PREVIOUS
+                )
+                // With speed 1.0 the system advances the position by itself while playing
+                .setState(
+                    if (playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED,
+                    position, if (playing) 1f else 0f
+                )
+                .build()
+        )
+        session.isActive = true
 
         val n = Notification.Builder(context, CHANNEL)
             .setSmallIcon(android.R.drawable.ic_media_play)
@@ -246,7 +297,11 @@ class MediaPlugin(
                 else action(android.R.drawable.ic_media_play, "Play", "play_pause", 2)
             )
             .addAction(action(android.R.drawable.ic_media_next, "Next", "next", 3))
-            .setStyle(Notification.MediaStyle().setShowActionsInCompactView(0, 1, 2))
+            .setStyle(
+                Notification.MediaStyle()
+                    .setMediaSession(session.sessionToken)
+                    .setShowActionsInCompactView(0, 1, 2)
+            )
             .build()
         nm.notify(NOTIFICATION_ID, n)
     }
