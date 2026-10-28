@@ -66,4 +66,22 @@ class ClipboardUserService : IClipboardService.Stub() {
         if (text == null) return
         call("setPrimaryClip", ClipData.newPlainText("bridge", text))
     }
+
+    /**
+     * Enables a NotificationListenerService without opening the system settings.
+     * Only the shell UID can do this. [component] is a flattened ComponentName.
+     */
+    override fun enableNotificationListener(component: String?) {
+        if (component == null) return
+        try {
+            val proc = ProcessBuilder("cmd", "notification", "allow_listener", component)
+                .redirectErrorStream(true)
+                .start()
+            val output = proc.inputStream.bufferedReader().readText().trim()
+            proc.waitFor()
+            Log.d(tag, "allow_listener $component: $output")
+        } catch (e: Exception) {
+            Log.e(tag, "allow_listener failed", e)
+        }
+    }
 }

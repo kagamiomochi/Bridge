@@ -5,3 +5,6 @@ android/gradle/
 android/gradlew
 android/gradlew.bat
 android/local.properties
+android/app/.gradle/
+android/app/.idea/
+android/app/local.properties

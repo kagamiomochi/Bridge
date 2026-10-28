@@ -6,4 +6,5 @@ interface IClipboardService {
 
     String getText() = 1;
     void setText(String text) = 2;
+    void enableNotificationListener(String component) = 3;
 }

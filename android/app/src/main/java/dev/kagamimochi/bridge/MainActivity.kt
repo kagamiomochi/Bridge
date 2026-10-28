@@ -178,6 +178,7 @@ class MainActivity : Activity() {
             "Shizuku service: ${if (Status.shizukuServiceBound) "bound" else "not bound"}\n" +
             "Connection: ${Status.connection}\n" +
             "Next retry: ${Status.retry.ifEmpty { "-" }}\n" +
+            "Media: ${Status.media}\n" +
             "Last event: ${Status.lastEvent}"
     }
 

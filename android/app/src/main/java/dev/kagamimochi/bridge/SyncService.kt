@@ -40,6 +40,7 @@ class SyncService : Service() {
     private lateinit var shizuku: ShizukuClipboard
     private lateinit var discovery: Discovery
     private val plugins = mutableListOf<BridgePlugin>()
+    private lateinit var media: MediaPlugin
     private var loop: Job? = null
 
     // Cuts the retry wait short when the network changes
@@ -64,6 +65,8 @@ class SyncService : Service() {
         discovery = Discovery(this)
         // Register new features here
         plugins += ClipboardPlugin(shizuku, scope)
+        media = MediaPlugin(this, shizuku, scope)
+        plugins += media
         watchNetwork()
     }
 
@@ -109,6 +112,11 @@ class SyncService : Service() {
         withTimeoutOrNull(ms) { wake.receive() } != null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Tapped a button on the Linux media notification
+        if (intent?.action == MediaPlugin.ACTION_CONTROL) {
+            media.sendControl(intent.getStringExtra(MediaPlugin.EXTRA_ACTION))
+            return START_STICKY
+        }
         if (loop == null) {
             // Keep trying to bind Shizuku until it succeeds
             scope.launch {

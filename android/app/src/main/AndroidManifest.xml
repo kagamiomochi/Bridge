@@ -27,7 +27,18 @@
             android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="clipboard_sync_over_local_network" />
+                android:value="clipboard_and_media_sync_over_local_network" />
+        </service>
+
+        <!-- Needed to read media sessions. Enabled through Shizuku (see MediaPlugin) -->
+        <service
+            android:name=".MediaListenerService"
+            android:exported="true"
+            android:label="Bridge media"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
         </service>
 
         <receiver

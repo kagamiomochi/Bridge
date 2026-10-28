@@ -18,7 +18,7 @@ class ShizukuClipboard(context: Context) {
 
     private val args = Shizuku.UserServiceArgs(
         ComponentName(context.packageName, ClipboardUserService::class.java.name)
-    ).processNameSuffix("clipboard").daemon(false).version(1)
+    ).processNameSuffix("clipboard").daemon(false).version(2)
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
@@ -61,5 +61,9 @@ class ShizukuClipboard(context: Context) {
 
     fun setText(text: String) {
         runCatching { service?.setText(text) }
+    }
+
+    fun enableNotificationListener(component: String) {
+        runCatching { service?.enableNotificationListener(component) }
     }
 }

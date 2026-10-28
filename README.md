@@ -1,6 +1,6 @@
 # Bridge
 
-LinuxとAndroidをつなぐ連携ソフトです。現在の機能はクリップボード同期のみで、機能追加はプラグインとして足せる設計になっています。
+LinuxとAndroidをつなぐ連携ソフトです。現在の機能はクリップボード同期と再生中メディアの同期で、機能追加はプラグインとして足せる設計になっています。
 
 - 通信は TLS (wss) で暗号化され、ペアリング済みの端末だけが接続できます
 - 接続先は mDNS で自動検出されます(IPアドレスの入力は不要)
@@ -25,13 +25,14 @@ Linux:
 - `python-websockets`
 - `wl-clipboard`
 - `openssl` (初回起動時の証明書生成に使います)
+- 任意: `playerctl` (再生中メディアの同期に使います。無い場合はメディア同期だけが無効になります)
 - 任意: `python-zeroconf` (mDNS による自動検出。無くてもデーモンは動きますが、手動でアドレスを指定することになります)
 - 任意: `libnotify` (`notify-send`。ペアリングコードをデスクトップ通知で表示します)
 
 Arch 系の場合:
 
 ```
-sudo pacman -S python-websockets python-zeroconf wl-clipboard openssl libnotify
+sudo pacman -S python-websockets python-zeroconf wl-clipboard playerctl openssl libnotify
 ```
 
 Android:
@@ -115,6 +116,9 @@ mDNS が届かない環境では、アプリのホスト欄に `192.168.x.x` ま
 bridge_daemon.py --pair         ペアリングの受付を2分間開き、コードを表示する
 bridge_daemon.py --devices      ペアリング済みの端末を一覧表示する
 bridge_daemon.py --revoke ID    端末を取り消す (その端末は接続できなくなる)
+bridge_daemon.py --media        スマホで再生中の曲を表示する
+bridge_daemon.py --media-control ACTION
+                                スマホのプレイヤーを操作する (play / pause / play_pause / next / previous)
 ```
 
 ## 設定とデータ
@@ -126,6 +130,8 @@ bridge_daemon.py --revoke ID    端末を取り消す (その端末は接続で�
 | `config.toml` | 待ち受けアドレス (`host`) とポート (`port`) |
 | `cert.pem`, `key.pem` | 初回起動時に作られる自己署名証明書と秘密鍵 |
 | `devices.json` | ペアリング済み端末。トークン本体ではなくハッシュだけを保存 |
+
+`$XDG_RUNTIME_DIR/bridge-media.json` には、スマホで再生中の曲の最新状態が書き込まれます (後述)。
 
 証明書を作り直すと、すべての端末で再ペアリングが必要になります。
 
@@ -146,6 +152,8 @@ WebSocket 上で、次の形式の JSON メッセージをやりとりします�
 | `pair.request` / `pair.challenge` / `pair.proof` / `pair.ok` / `pair.denied` | 双方 | ペアリング |
 | `hello` / `hello.ok` | 双方 | 接続時の認証 (端末ID とトークン) |
 | `clipboard.update` | 双方 | クリップボードの内容 (テキスト、最大1 MiB) |
+| `media.state` | 双方 | 再生中のメディアの状態 (`status` / `player` / `title` / `artist` / `album` / `duration_ms` / `position_ms`) |
+| `media.control` | 双方 | 相手側のプレイヤーの操作 (`action`: `play` / `pause` / `play_pause` / `next` / `previous`) |
 
 ### セキュリティ
 
@@ -162,6 +170,16 @@ WebSocket 上で、次の形式の JSON メッセージをやりとりします�
 - Android: Shizuku の shell 権限プロセス (`ClipboardUserService`) から、内部のクリップボードサービスに直接アクセスします。500ms ごとに確認します。
 - 受信した内容を書き戻したときに、同じ内容が送り返されて無限に往復しないよう、内容のハッシュで見分けています。
 - 対象はテキストのみです。画像などは同期しません。
+
+### 再生中メディアの同期
+
+両方向で、再生中の曲の状態を送り合います。
+
+- Linux → スマホ: `playerctl` (MPRIS) で再生状態の変化を検知して送ります。スマホには通知が出て、曲名・アーティストと、前へ / 再生・一時停止 / 次への操作ボタンが付きます。ボタンを押すと Linux のプレイヤーが操作されます。
+- スマホ → Linux: スマホの再生中のメディアセッション (再生中のものを優先) を送ります。Linux側は最新の状態を `$XDG_RUNTIME_DIR/bridge-media.json` に書き出すので、waybar などのバーやスクリプトから読めます。`bridge_daemon.py --media` で表示、`bridge_daemon.py --media-control next` などで操作できます。
+- Android: メディアセッションの読み取りには通知へのアクセス権 (`MediaListenerService`) が必要です。Shizuku 経由で自動的に有効にするので、設定画面を開く必要はありません。有効にならない場合は、設定の「通知へのアクセス」で Bridge を手動で許可してください。
+- 接続したときに、Linux で再生中なら現在の状態がすぐスマホに送られます。
+- 再生位置は状態の変化 (曲の切り替え、再生・一時停止など) のたびに送ります。シークだけでは再送しません。
 
 ### 自動再接続
 
@@ -230,13 +248,15 @@ plugins += NotifyPlugin()
 | `Connection: searching on the local network` | mDNS で探しています。見つからない場合は UDP 5353 とネットワーク (APアイソレーション) を確認してください。手動でアドレスを指定する方法もあります |
 | `Connection: failed: ...` | Linuxに届いていません。TCP 8765 とデーモンの起動を確認してください |
 | `Connection: closed (4401 ...)` | 端末が取り消されたか、ペアリング情報が一致しません。再ペアリングしてください |
+| `Media: waiting for listener permission` (Last event) | 通知へのアクセス権がまだ有効になっていません。Shizuku が起動していれば自動で有効になります。ならない場合は設定の「通知へのアクセス」で Bridge を許可してください |
 
 Linux側の動作は、デーモンのログ (`journalctl --user -u bridge`) で確認できます。クリップボードが変わるたびに `local clipboard changed` と `received clipboard from client` が出ます。
 
 ## 制限事項
 
-- Linux側は Wayland (wl-clipboard) のみ対応です。
+- Linux側は Wayland (wl-clipboard) のみ対応です。メディア同期は MPRIS 対応のプレイヤーが対象です。
 - クリップボードはテキストのみで、最大1 MiB です。
+- メディアは、アルバムアートや再生位置のリアルタイム表示には対応していません。また、複数のプレイヤーが同時にあるとき、Linux側はどれを送るかを `playerctl` の既定の選び方に任せています (Android側は再生中のものを優先します)。
 - スマホが記憶できるペアリング先は1台です (Linux側は複数の端末を登録できます)。
 - Android の内部クリップボード API はバージョンによって引数が違うため、型から引数を組み立てています。Android 14 以降の端末では、特に動作を確認してください。
 - 通信は IPv4 のみを想定しています。

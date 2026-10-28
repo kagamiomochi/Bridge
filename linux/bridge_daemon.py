@@ -6,6 +6,10 @@ Usage:
     bridge_daemon.py --pair         open a 2 minute pairing window and show the code
     bridge_daemon.py --devices      list paired devices
     bridge_daemon.py --revoke ID    remove a paired device
+    bridge_daemon.py --media        show what the phone is playing
+    bridge_daemon.py --media-control ACTION
+                                    control the phone's player
+                                    (play, pause, play_pause, next, previous)
 """
 import asyncio
 import hashlib
@@ -376,9 +380,14 @@ async def start_control(hub: Hub):
     path.unlink(missing_ok=True)
 
     async def on_client(reader, writer):
-        cmd = (await reader.readline()).decode().strip()
+        line = (await reader.readline()).decode().strip()
+        cmd, _, arg = line.partition(" ")
         if cmd == "pair":
             writer.write(f"{hub.open_pairing()}\n".encode())
+        elif cmd == "media-control":
+            media = hub.plugins.get("media")
+            ok = isinstance(media, MediaPlugin) and await media.control_remote(arg.strip())
+            writer.write(b"ok\n" if ok else b"error\n")
         await writer.drain()
         writer.close()
 
@@ -459,6 +468,166 @@ class ClipboardPlugin(Plugin):
         await self.hub.broadcast("clipboard.update", data, exclude=ws)
 
 
+def media_state_path() -> Path:
+    """File where the phone's latest now-playing state is kept (for bars and scripts)."""
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime:
+        return Path(runtime) / "bridge-media.json"
+    return Path(f"/tmp/bridge-media-{os.getuid()}.json")
+
+
+class MediaPlugin(Plugin):
+    """Now-playing sync using MPRIS (playerctl).
+
+    Linux -> phone: `media.state` is sent whenever the local player changes.
+    Phone -> Linux: the phone's `media.state` is stored in media_state_path().
+    Either side can send `media.control` to operate the other side's player.
+    """
+
+    prefix = "media"
+    SEP = "\x1f"  # field separator for the playerctl format string
+    FORMAT = SEP.join([
+        "{{status}}", "{{playerName}}", "{{title}}", "{{artist}}",
+        "{{album}}", "{{mpris:length}}", "{{position}}",
+    ])
+    ACTIONS = {
+        "play": "play", "pause": "pause", "play_pause": "play-pause",
+        "next": "next", "previous": "previous",
+    }
+    STATUSES = {"playing", "paused", "stopped"}
+    MAX_TEXT = 512
+
+    def __init__(self):
+        self.available = shutil.which("playerctl") is not None
+        self.local: dict = self._stopped()
+        self.last_sent: tuple | None = None
+
+    @staticmethod
+    def _stopped() -> dict:
+        return {"status": "stopped", "player": "", "title": "", "artist": "",
+                "album": "", "duration_ms": 0, "position_ms": 0}
+
+    @staticmethod
+    def _signature(state: dict) -> tuple:
+        # Position is left out on purpose so that it does not cause constant re-sends
+        return (state["status"], state["player"], state["title"],
+                state["artist"], state["album"], state["duration_ms"])
+
+    @staticmethod
+    def _to_ms(value: str) -> int:
+        try:
+            return max(0, int(value) // 1000)  # MPRIS reports microseconds
+        except ValueError:
+            return 0
+
+    def _parse(self, line: str) -> dict:
+        parts = line.split(self.SEP)
+        if len(parts) != 7 or not parts[0]:
+            return self._stopped()
+        status = parts[0].lower()
+        if status not in self.STATUSES:
+            return self._stopped()
+        return {
+            "status": status,
+            "player": parts[1][: self.MAX_TEXT],
+            "title": parts[2][: self.MAX_TEXT],
+            "artist": parts[3][: self.MAX_TEXT],
+            "album": parts[4][: self.MAX_TEXT],
+            "duration_ms": self._to_ms(parts[5]),
+            "position_ms": self._to_ms(parts[6]),
+        }
+
+    async def start(self) -> None:
+        if not self.available:
+            log.error("playerctl is not installed: media plugin is disabled")
+            return
+        asyncio.create_task(self._watch())
+
+    async def _publish(self, state: dict) -> None:
+        sig = self._signature(state)
+        if sig == self.last_sent:
+            return
+        self.last_sent = sig
+        log.info("local media: %s - %s (%s)", state["artist"], state["title"], state["status"])
+        await self.hub.broadcast("media.state", state)
+
+    async def _watch(self) -> None:
+        warned = False
+        while True:
+            # `playerctl --follow` prints one line each time the player state changes
+            proc = await asyncio.create_subprocess_exec(
+                "playerctl", "--follow", "metadata", "--format", self.FORMAT,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            )
+            async for raw in proc.stdout:
+                warned = False
+                self.local = self._parse(raw.decode(errors="replace").rstrip("\n"))
+                await self._publish(self.local)
+            await proc.wait()
+            # No player is running (or playerctl died): tell the phone playback stopped
+            self.local = self._stopped()
+            await self._publish(self.local)
+            if not warned:
+                log.info("playerctl exited (no player running?), retrying")
+                warned = True
+            await asyncio.sleep(2)
+
+    async def on_connect(self, ws) -> None:
+        # Send the current state right after connecting
+        if self.available and self.local["status"] != "stopped":
+            await ws.send(encode("media.state", self.local))
+
+    async def _playerctl(self, action: str) -> None:
+        proc = await asyncio.create_subprocess_exec(
+            "playerctl", self.ACTIONS[action],
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+
+    def _store_remote(self, data: dict) -> None:
+        """Keep the phone's state in a file; written atomically so readers never see half of it."""
+        status = str(data.get("status", "stopped")).lower()
+        if status not in self.STATUSES:
+            status = "stopped"
+
+        def text(key: str) -> str:
+            return str(data.get(key, ""))[: self.MAX_TEXT]
+
+        def num(key: str) -> int:
+            v = data.get(key, 0)
+            return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else 0
+
+        state = {
+            "status": status, "player": text("player"), "title": text("title"),
+            "artist": text("artist"), "album": text("album"),
+            "duration_ms": num("duration_ms"), "position_ms": num("position_ms"),
+            "updated": int(time.time()),
+        }
+        path = media_state_path()
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False))
+        tmp.chmod(0o600)
+        tmp.replace(path)
+        log.info("phone media: %s - %s (%s)", state["artist"], state["title"], status)
+
+    async def on_message(self, ws, type_: str, data: dict) -> None:
+        if type_ == "media.state":
+            if isinstance(data, dict):
+                self._store_remote(data)
+        elif type_ == "media.control":
+            action = data.get("action") if isinstance(data, dict) else None
+            if self.available and action in self.ACTIONS:
+                log.info("media control from client: %s", action)
+                await self._playerctl(action)
+
+    async def control_remote(self, action: str) -> bool:
+        """Send a control command to the phone. False if the action is unknown or nobody is connected."""
+        if action not in self.ACTIONS or not self.hub.clients:
+            return False
+        await self.hub.broadcast("media.control", {"action": action})
+        return True
+
+
 def run_cli(argv: list[str]) -> bool:
     """Handle management commands. Returns True if one was handled."""
     if "--pair" in argv:
@@ -471,6 +640,35 @@ def run_cli(argv: list[str]) -> bool:
             print("The daemon is not running. Start it first.", file=sys.stderr)
             sys.exit(1)
         print(f"Pairing code: {code}  (valid for {PAIR_WINDOW_SECONDS // 60} minutes)")
+        return True
+    if "--media-control" in argv:
+        idx = argv.index("--media-control")
+        if idx + 1 >= len(argv) or argv[idx + 1] not in MediaPlugin.ACTIONS:
+            print(f"usage: bridge_daemon.py --media-control {{{'|'.join(MediaPlugin.ACTIONS)}}}",
+                  file=sys.stderr)
+            sys.exit(2)
+        try:
+            with socket.socket(socket.AF_UNIX) as s:
+                s.connect(str(control_path()))
+                s.sendall(f"media-control {argv[idx + 1]}\n".encode())
+                reply = s.makefile().readline().strip()
+        except OSError:
+            print("The daemon is not running. Start it first.", file=sys.stderr)
+            sys.exit(1)
+        if reply != "ok":
+            print("Failed: no phone is connected.", file=sys.stderr)
+            sys.exit(1)
+        return True
+    if "--media" in argv:
+        try:
+            st = json.loads(media_state_path().read_text())
+        except (OSError, ValueError):
+            print("No media information from the phone yet.")
+            return True
+        if st.get("status") == "stopped" or not st.get("title"):
+            print("Nothing is playing on the phone.")
+        else:
+            print(f"[{st['status']}] {st['title']} - {st['artist']}  ({st['player']})")
         return True
     if "--devices" in argv:
         devices = DeviceStore().all()
@@ -500,6 +698,7 @@ async def main() -> None:
     hub = Hub(devices, PairingManager(), bytes.fromhex(fp))
     # Register new features here
     hub.register(ClipboardPlugin())
+    hub.register(MediaPlugin())
     for p in hub.plugins.values():
         await p.start()
 
