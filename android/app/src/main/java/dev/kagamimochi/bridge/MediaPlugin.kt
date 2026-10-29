@@ -421,18 +421,18 @@ class MediaPlugin(
         session.isActive = true
 
         val builder = Notification.Builder(context, CHANNEL)
-            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setSmallIcon(R.drawable.ic_stat_music)
             .setContentTitle(title)
             .setContentText(text)
             .setSubText("Linux" + data.optString("player").let { if (it.isEmpty()) "" else ": $it" })
             .setOnlyAlertOnce(true)
             .setOngoing(playing)
-            .addAction(action(android.R.drawable.ic_media_previous, "Previous", "previous", 1))
+            .addAction(action(R.drawable.ic_media_previous_flat, "Previous", "previous", 1))
             .addAction(
-                if (playing) action(android.R.drawable.ic_media_pause, "Pause", "play_pause", 2)
-                else action(android.R.drawable.ic_media_play, "Play", "play_pause", 2)
+                if (playing) action(R.drawable.ic_media_pause_flat, "Pause", "play_pause", 2)
+                else action(R.drawable.ic_media_play_flat, "Play", "play_pause", 2)
             )
-            .addAction(action(android.R.drawable.ic_media_next, "Next", "next", 3))
+            .addAction(action(R.drawable.ic_media_next_flat, "Next", "next", 3))
             .setStyle(
                 Notification.MediaStyle()
                     .setMediaSession(session.sessionToken)
