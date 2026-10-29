@@ -10,10 +10,14 @@ Usage:
     bridge_daemon.py --media-control ACTION
                                     control the phone's player
                                     (play, pause, play_pause, next, previous)
+    bridge_daemon.py --media-seek SECONDS
+                                    seek in the phone's player
 """
 import asyncio
+import base64
 import hashlib
 import hmac
+import io
 import json
 import logging
 import os
@@ -25,6 +29,8 @@ import subprocess
 import sys
 import time
 import tomllib
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -384,9 +390,14 @@ async def start_control(hub: Hub):
         cmd, _, arg = line.partition(" ")
         if cmd == "pair":
             writer.write(f"{hub.open_pairing()}\n".encode())
-        elif cmd == "media-control":
+        elif cmd in ("media-control", "media-seek"):
             media = hub.plugins.get("media")
-            ok = isinstance(media, MediaPlugin) and await media.control_remote(arg.strip())
+            ok = False
+            if isinstance(media, MediaPlugin):
+                if cmd == "media-seek":
+                    ok = arg.strip().isdigit() and await media.control_remote("seek", int(arg))
+                else:
+                    ok = await media.control_remote(arg.strip())
             writer.write(b"ok\n" if ok else b"error\n")
         await writer.drain()
         writer.close()
@@ -476,19 +487,46 @@ def media_state_path() -> Path:
     return Path(f"/tmp/bridge-media-{os.getuid()}.json")
 
 
+def media_art_path() -> Path:
+    """File where the phone's current cover art is kept."""
+    return media_state_path().with_name("bridge-media-art.jpg")
+
+
+def image_mime(raw: bytes) -> str | None:
+    """Returns the MIME type for JPEG / PNG / WebP data, or None for anything else."""
+    if raw.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def write_private(path: Path, data: bytes) -> None:
+    """Writes atomically with mode 0600, so readers never see half of a file."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(data)
+    tmp.chmod(0o600)
+    tmp.replace(path)
+
+
 class MediaPlugin(Plugin):
     """Now-playing sync using MPRIS (playerctl).
 
-    Linux -> phone: `media.state` is sent whenever the local player changes.
-    Phone -> Linux: the phone's `media.state` is stored in media_state_path().
-    Either side can send `media.control` to operate the other side's player.
+    Linux -> phone: `media.state` is sent whenever the local player changes, and
+    `media.art` carries the cover (once per track). The position is checked
+    regularly, so seeking on the Linux side reaches the phone too.
+    Phone -> Linux: the phone's `media.state` is stored in media_state_path() and
+    its cover in media_art_path().
+    Either side can send `media.control` (including `seek`) to operate the other player.
     """
 
     prefix = "media"
     SEP = "\x1f"  # field separator for the playerctl format string
     FORMAT = SEP.join([
         "{{status}}", "{{playerName}}", "{{title}}", "{{artist}}",
-        "{{album}}", "{{mpris:length}}", "{{position}}",
+        "{{album}}", "{{mpris:length}}", "{{position}}", "{{mpris:artUrl}}",
     ])
     ACTIONS = {
         "play": "play", "pause": "pause", "play_pause": "play-pause",
@@ -496,22 +534,35 @@ class MediaPlugin(Plugin):
     }
     STATUSES = {"playing", "paused", "stopped"}
     MAX_TEXT = 512
+    MAX_POSITION_MS = 24 * 3600 * 1000
+    ART_MAX_PX = 512             # covers are scaled down to this size (needs Pillow)
+    ART_MAX_BYTES = 600_000      # limit for what is sent to the phone
+    ART_FETCH_LIMIT = 8 << 20    # do not read bigger source images than this
+    RESYNC_INTERVAL = 1.5        # seconds between position checks
+    DRIFT_MS = 1500              # a position this far off the expected one counts as a seek
 
     def __init__(self):
         self.available = shutil.which("playerctl") is not None
         self.local: dict = self._stopped()
         self.last_sent: tuple | None = None
+        self.pos_ref = (0, time.monotonic())   # position (ms) at the time of the last send
+        self.art: dict | None = None            # last cover that was prepared for the phone
+        self.art_task: asyncio.Task | None = None
+        self.warned_pillow = False
+        # The phone's state, as stored in the state file
+        self.remote: dict = {}
+        self.remote_art_id = ""
 
     @staticmethod
     def _stopped() -> dict:
         return {"status": "stopped", "player": "", "title": "", "artist": "",
-                "album": "", "duration_ms": 0, "position_ms": 0}
+                "album": "", "duration_ms": 0, "position_ms": 0, "art_id": ""}
 
     @staticmethod
     def _signature(state: dict) -> tuple:
         # Position is left out on purpose so that it does not cause constant re-sends
-        return (state["status"], state["player"], state["title"],
-                state["artist"], state["album"], state["duration_ms"])
+        return (state["status"], state["player"], state["title"], state["artist"],
+                state["album"], state["duration_ms"], state["art_id"])
 
     @staticmethod
     def _to_ms(value: str) -> int:
@@ -520,13 +571,15 @@ class MediaPlugin(Plugin):
         except ValueError:
             return 0
 
-    def _parse(self, line: str) -> dict:
+    def _parse(self, line: str) -> tuple[dict, str]:
+        """Returns the state to send and the cover URL (which stays on this machine)."""
         parts = line.split(self.SEP)
-        if len(parts) != 7 or not parts[0]:
-            return self._stopped()
+        if len(parts) != 8 or not parts[0]:
+            return self._stopped(), ""
         status = parts[0].lower()
         if status not in self.STATUSES:
-            return self._stopped()
+            return self._stopped(), ""
+        art_url = parts[7].strip()
         return {
             "status": status,
             "player": parts[1][: self.MAX_TEXT],
@@ -535,21 +588,90 @@ class MediaPlugin(Plugin):
             "album": parts[4][: self.MAX_TEXT],
             "duration_ms": self._to_ms(parts[5]),
             "position_ms": self._to_ms(parts[6]),
-        }
+            "art_id": hashlib.sha256(art_url.encode()).hexdigest()[:16] if art_url else "",
+        }, art_url
 
     async def start(self) -> None:
         if not self.available:
             log.error("playerctl is not installed: media plugin is disabled")
             return
         asyncio.create_task(self._watch())
+        asyncio.create_task(self._position_loop())
 
-    async def _publish(self, state: dict) -> None:
-        sig = self._signature(state)
-        if sig == self.last_sent:
-            return
-        self.last_sent = sig
-        log.info("local media: %s - %s (%s)", state["artist"], state["title"], state["status"])
+    # ---- Linux -> phone ----
+
+    async def _send(self, state: dict) -> None:
+        self.last_sent = self._signature(state)
+        self.pos_ref = (state["position_ms"], time.monotonic())
         await self.hub.broadcast("media.state", state)
+
+    async def _publish(self, state: dict, art_url: str) -> None:
+        if self._signature(state) == self.last_sent:
+            return
+        log.info("local media: %s - %s (%s)", state["artist"], state["title"], state["status"])
+        await self._send(state)
+        if self.art_task:
+            self.art_task.cancel()
+        if not art_url:
+            self.art = None
+        elif not self.art or self.art["id"] != state["art_id"]:
+            self.art = None
+            self.art_task = asyncio.create_task(self._load_art(art_url, state["art_id"]))
+
+    async def _load_art(self, art_url: str, art_id: str) -> None:
+        loaded = await asyncio.to_thread(self._fetch_art, art_url)
+        if not loaded or self.local["art_id"] != art_id:
+            return  # failed, or the track changed in the meantime
+        mime, raw = loaded
+        self.art = {"id": art_id, "mime": mime, "data": base64.b64encode(raw).decode()}
+        await self.hub.broadcast("media.art", self.art)
+
+    def _fetch_art(self, url: str) -> tuple[str, bytes] | None:
+        """Blocking: reads the cover from a file:// or http(s):// URL. Runs in a thread."""
+        try:
+            parsed = urllib.parse.urlparse(url)
+            if parsed.scheme == "file":
+                path = Path(urllib.parse.unquote(parsed.path))
+                if path.stat().st_size > self.ART_FETCH_LIMIT:
+                    return None
+                raw = path.read_bytes()
+            elif parsed.scheme in ("http", "https"):
+                req = urllib.request.Request(url, headers={"User-Agent": "bridge"})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    raw = resp.read(self.ART_FETCH_LIMIT + 1)
+                if len(raw) > self.ART_FETCH_LIMIT:
+                    return None
+            else:
+                return None
+        except Exception as e:  # unreachable server, missing file, bad URL, ...
+            log.debug("cover art not available (%s): %s", url, e)
+            return None
+        # Only ever send real images, never whatever a player's URL happens to point at
+        mime = image_mime(raw)
+        if mime is None:
+            return None
+        return self._shrink(raw, mime)
+
+    def _shrink(self, raw: bytes, mime: str) -> tuple[str, bytes] | None:
+        try:
+            from PIL import Image
+        except ImportError:
+            if len(raw) <= self.ART_MAX_BYTES:
+                return mime, raw
+            if not self.warned_pillow:
+                log.warning("cover art is large: install python-pillow to scale it down")
+                self.warned_pillow = True
+            return None
+        try:
+            img = Image.open(io.BytesIO(raw))
+            img.thumbnail((self.ART_MAX_PX, self.ART_MAX_PX))
+            buf = io.BytesIO()
+            img.convert("RGB").save(buf, "JPEG", quality=85)
+        except Exception as e:
+            log.debug("cover art could not be converted: %s", e)
+            return None
+        data = buf.getvalue()
+        return ("image/jpeg", data) if len(data) <= self.ART_MAX_BYTES else None
 
     async def _watch(self) -> None:
         warned = False
@@ -561,71 +683,148 @@ class MediaPlugin(Plugin):
             )
             async for raw in proc.stdout:
                 warned = False
-                self.local = self._parse(raw.decode(errors="replace").rstrip("\n"))
-                await self._publish(self.local)
+                self.local, art_url = self._parse(raw.decode(errors="replace").rstrip("\n"))
+                await self._publish(self.local, art_url)
             await proc.wait()
             # No player is running (or playerctl died): tell the phone playback stopped
             self.local = self._stopped()
-            await self._publish(self.local)
+            await self._publish(self.local, "")
             if not warned:
                 log.info("playerctl exited (no player running?), retrying")
                 warned = True
             await asyncio.sleep(2)
 
+    async def _query_position(self) -> int | None:
+        proc = await asyncio.create_subprocess_exec(
+            "playerctl", "position",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await proc.communicate()
+        try:
+            return max(0, int(float(out.decode().strip()) * 1000))
+        except ValueError:
+            return None
+
+    async def _resync(self) -> None:
+        """Re-sends the state if the position is not where the phone expects it (a seek)."""
+        if self.local["status"] == "stopped":
+            return
+        position = await self._query_position()
+        if position is None:
+            return
+        ref_ms, ref_time = self.pos_ref
+        expected = ref_ms
+        if self.local["status"] == "playing":
+            expected += int((time.monotonic() - ref_time) * 1000)
+        if abs(position - expected) > self.DRIFT_MS:
+            self.local = {**self.local, "position_ms": position}
+            await self._send(self.local)
+
+    async def _position_loop(self) -> None:
+        # playerctl's follow mode does not report seeks, so the position is polled
+        while True:
+            await asyncio.sleep(self.RESYNC_INTERVAL)
+            if self.hub.clients:
+                await self._resync()
+
     async def on_connect(self, ws) -> None:
-        # Send the current state right after connecting
+        # Send the current state (and its cover) right after connecting
         if self.available and self.local["status"] != "stopped":
             await ws.send(encode("media.state", self.local))
+            if self.art and self.art["id"] == self.local["art_id"]:
+                await ws.send(encode("media.art", self.art))
 
-    async def _playerctl(self, action: str) -> None:
+    # ---- control ----
+
+    async def _playerctl(self, *args: str) -> None:
         proc = await asyncio.create_subprocess_exec(
-            "playerctl", self.ACTIONS[action],
+            "playerctl", *args,
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         )
         await proc.wait()
 
+    @classmethod
+    def _valid_position(cls, value) -> bool:
+        return (isinstance(value, int) and not isinstance(value, bool)
+                and 0 <= value <= cls.MAX_POSITION_MS)
+
+    async def control_remote(self, action: str, position_ms: int | None = None) -> bool:
+        """Send a control command to the phone. False if invalid or nobody is connected."""
+        data: dict = {"action": action}
+        if action == "seek":
+            if not self._valid_position(position_ms):
+                return False
+            data["position_ms"] = position_ms
+        elif action not in self.ACTIONS:
+            return False
+        if not self.hub.clients:
+            return False
+        await self.hub.broadcast("media.control", data)
+        return True
+
+    # ---- phone -> Linux ----
+
+    @classmethod
+    def _text(cls, data: dict, key: str) -> str:
+        return str(data.get(key, ""))[: cls.MAX_TEXT]
+
+    @staticmethod
+    def _num(data: dict, key: str) -> int:
+        v = data.get(key, 0)
+        return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else 0
+
+    def _write_remote(self) -> None:
+        """Keeps the phone's state in a file that bars and scripts can read."""
+        art_id = self.remote.get("art_id", "")
+        art_ready = bool(art_id) and art_id == self.remote_art_id and media_art_path().exists()
+        state = {**self.remote, "art_path": str(media_art_path()) if art_ready else ""}
+        write_private(media_state_path(), json.dumps(state, ensure_ascii=False).encode())
+
     def _store_remote(self, data: dict) -> None:
-        """Keep the phone's state in a file; written atomically so readers never see half of it."""
-        status = str(data.get("status", "stopped")).lower()
+        status = self._text(data, "status").lower()
         if status not in self.STATUSES:
             status = "stopped"
-
-        def text(key: str) -> str:
-            return str(data.get(key, ""))[: self.MAX_TEXT]
-
-        def num(key: str) -> int:
-            v = data.get(key, 0)
-            return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else 0
-
-        state = {
-            "status": status, "player": text("player"), "title": text("title"),
-            "artist": text("artist"), "album": text("album"),
-            "duration_ms": num("duration_ms"), "position_ms": num("position_ms"),
+        self.remote = {
+            "status": status, "player": self._text(data, "player"),
+            "title": self._text(data, "title"), "artist": self._text(data, "artist"),
+            "album": self._text(data, "album"),
+            "duration_ms": self._num(data, "duration_ms"),
+            "position_ms": self._num(data, "position_ms"),
+            "art_id": self._text(data, "art_id")[:64],
             "updated": int(time.time()),
         }
-        path = media_state_path()
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state, ensure_ascii=False))
-        tmp.chmod(0o600)
-        tmp.replace(path)
-        log.info("phone media: %s - %s (%s)", state["artist"], state["title"], status)
+        self._write_remote()
+        log.info("phone media: %s - %s (%s)", self.remote["artist"], self.remote["title"], status)
+
+    def _store_remote_art(self, data: dict) -> None:
+        art_id = self._text(data, "id")[:64]
+        try:
+            raw = base64.b64decode(str(data.get("data", "")), validate=True)
+        except ValueError:
+            return
+        if not art_id or len(raw) > self.ART_MAX_BYTES or image_mime(raw) is None:
+            return
+        write_private(media_art_path(), raw)
+        self.remote_art_id = art_id
+        if self.remote:
+            self._write_remote()  # now the state file can point at the cover
 
     async def on_message(self, ws, type_: str, data: dict) -> None:
+        if not isinstance(data, dict):
+            return
         if type_ == "media.state":
-            if isinstance(data, dict):
-                self._store_remote(data)
-        elif type_ == "media.control":
-            action = data.get("action") if isinstance(data, dict) else None
-            if self.available and action in self.ACTIONS:
+            self._store_remote(data)
+        elif type_ == "media.art":
+            self._store_remote_art(data)
+        elif type_ == "media.control" and self.available:
+            action = data.get("action")
+            if action in self.ACTIONS:
                 log.info("media control from client: %s", action)
-                await self._playerctl(action)
-
-    async def control_remote(self, action: str) -> bool:
-        """Send a control command to the phone. False if the action is unknown or nobody is connected."""
-        if action not in self.ACTIONS or not self.hub.clients:
-            return False
-        await self.hub.broadcast("media.control", {"action": action})
-        return True
+                await self._playerctl(self.ACTIONS[action])
+            elif action == "seek" and self._valid_position(data.get("position_ms")):
+                log.info("media seek from client: %s ms", data["position_ms"])
+                await self._playerctl("position", f"{data['position_ms'] / 1000:.3f}")
+                await self._resync()  # confirm the real position to the phone right away
 
 
 def run_cli(argv: list[str]) -> bool:
@@ -652,6 +851,26 @@ def run_cli(argv: list[str]) -> bool:
                 s.connect(str(control_path()))
                 s.sendall(f"media-control {argv[idx + 1]}\n".encode())
                 reply = s.makefile().readline().strip()
+        except OSError:
+            print("The daemon is not running. Start it first.", file=sys.stderr)
+            sys.exit(1)
+        if reply != "ok":
+            print("Failed: no phone is connected.", file=sys.stderr)
+            sys.exit(1)
+        return True
+    if "--media-seek" in argv:
+        idx = argv.index("--media-seek")
+        try:
+            ms = int(float(argv[idx + 1]) * 1000)
+            assert 0 <= ms <= MediaPlugin.MAX_POSITION_MS
+        except (IndexError, ValueError, AssertionError):
+            print("usage: bridge_daemon.py --media-seek SECONDS", file=sys.stderr)
+            sys.exit(2)
+        try:
+            with socket.socket(socket.AF_UNIX) as sock:
+                sock.connect(str(control_path()))
+                sock.sendall(f"media-seek {ms}\n".encode())
+                reply = sock.makefile().readline().strip()
         except OSError:
             print("The daemon is not running. Start it first.", file=sys.stderr)
             sys.exit(1)

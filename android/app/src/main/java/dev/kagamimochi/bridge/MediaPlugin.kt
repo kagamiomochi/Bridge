@@ -7,6 +7,8 @@ import android.app.PendingIntent
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.drawable.Icon
 import android.media.AudioManager
 import android.media.MediaMetadata
@@ -16,7 +18,9 @@ import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
+import android.util.Base64
 import android.view.KeyEvent
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -26,13 +30,17 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
+import java.security.MessageDigest
+import kotlin.math.abs
 
 /**
  * Now-playing sync.
  *
- * Phone -> Linux: the active media session is sent as `media.state`.
- * Linux -> phone: the Linux player is shown as a notification with
- * previous / play-pause / next buttons, which send `media.control` back.
+ * Phone -> Linux: the active media session is sent as `media.state`, and its cover
+ * art as `media.art` (once per track).
+ * Linux -> phone: the Linux player is shown in the system media controls, with cover
+ * art and a seek bar. Button presses and seeks are sent back as `media.control`.
  * `media.control` from Linux operates the phone's player.
  */
 class MediaPlugin(
@@ -56,6 +64,15 @@ class MediaPlugin(
     private var current: MediaController? = null
     @Volatile private var lastSignature: String? = null
 
+    // Position that was last sent to Linux: (position ms, elapsedRealtime, playing)
+    @Volatile private var positionRef: Triple<Long, Long, Boolean>? = null
+    @Volatile private var artSentId: String? = null
+
+    // Last things received from Linux
+    @Volatile private var remoteState: JSONObject? = null
+    @Volatile private var remoteArt: Pair<String, Bitmap>? = null
+    @Volatile private var remotePlaying = false
+
     /**
      * A media session that stands for the Linux player. With a MediaStyle notification
      * attached to it, Android shows it in the system media controls (quick settings,
@@ -67,6 +84,11 @@ class MediaPlugin(
             override fun onPause() = sendControl("pause")
             override fun onSkipToNext() = sendControl("next")
             override fun onSkipToPrevious() = sendControl("previous")
+            override fun onSeekTo(pos: Long) {
+                // Move the bar right away; Linux sends the real position afterwards
+                applyPlaybackState(remotePlaying, pos)
+                sendControl("seek", pos)
+            }
         }, main)
     }
 
@@ -94,6 +116,8 @@ class MediaPlugin(
     override fun onConnected(sender: Sender) {
         this.sender = sender
         lastSignature = null
+        positionRef = null
+        artSentId = null
         job = scope.launch(Dispatchers.IO) {
             // The listener may not be effective right after it was enabled, so retry until it works
             while (isActive) {
@@ -109,6 +133,8 @@ class MediaPlugin(
     override fun onDisconnected() {
         job?.cancel()
         sender = null
+        remoteState = null
+        remoteArt = null
         hideRemote()
         main.post { detach() }
     }
@@ -173,11 +199,15 @@ class MediaPlugin(
     private fun publish() {
         val c = current
         val state = JSONObject()
+        var art: Bitmap? = null
+        var position = 0L
+        var playing = false
         if (c == null) {
             state.put("status", "stopped")
         } else {
             val md = c.metadata
             val ps = c.playbackState
+            playing = ps?.state == PlaybackState.STATE_PLAYING
             state.put(
                 "status", when (ps?.state) {
                     PlaybackState.STATE_PLAYING, PlaybackState.STATE_BUFFERING -> "playing"
@@ -189,16 +219,76 @@ class MediaPlugin(
             state.put("title", md?.getString(MediaMetadata.METADATA_KEY_TITLE).orEmpty())
             state.put("artist", md?.getString(MediaMetadata.METADATA_KEY_ARTIST).orEmpty())
             state.put("album", md?.getString(MediaMetadata.METADATA_KEY_ALBUM).orEmpty())
-            state.put("duration_ms", (md?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: 0L).coerceAtLeast(0))
-            state.put("position_ms", (ps?.position ?: 0L).coerceAtLeast(0))
+            val duration = (md?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: 0L).coerceAtLeast(0)
+            state.put("duration_ms", duration)
+            position = currentPosition(ps).coerceIn(0L, if (duration > 0) duration else Long.MAX_VALUE)
+            state.put("position_ms", position)
+            art = md?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
+                ?: md?.getBitmap(MediaMetadata.METADATA_KEY_ART)
+            // Identifies the track, so Linux can tell which cover belongs to this state
+            state.put("art_id", hash16(listOf("player", "title", "artist", "album").joinToString("|") { state.optString(it) }))
         }
         // Position is not part of the signature, so it does not cause constant re-sends
         val signature = listOf("status", "player", "title", "artist", "album", "duration_ms")
             .joinToString("|") { state.optString(it) }
-        if (signature == lastSignature) return
-        lastSignature = signature
-        Status.media = "sent: ${state.optString("title")} (${state.optString("status")})"
-        sender?.send("media.state", state)
+        val now = SystemClock.elapsedRealtime()
+        val ref = positionRef
+        val changed = signature != lastSignature
+        // A seek shows up as a gap between the reported position and the expected one
+        val drifted = !changed && ref != null &&
+            abs(position - (ref.first + if (ref.third) now - ref.second else 0L)) > DRIFT_MS
+        if (changed || drifted) {
+            lastSignature = signature
+            positionRef = Triple(position, now, playing)
+            Status.media = "sent: ${state.optString("title")} (${state.optString("status")})"
+            sender?.send("media.state", state)
+        }
+        // The cover is sent separately, once per track, because it is much larger than the state
+        val artId = state.optString("art_id")
+        if (art != null && artId.isNotEmpty() && artId != artSentId) {
+            artSentId = artId
+            sendArt(artId, art)
+        }
+    }
+
+    /** The position right now. PlaybackState.position is only valid at lastPositionUpdateTime. */
+    private fun currentPosition(ps: PlaybackState?): Long {
+        if (ps == null) return 0L
+        if (ps.state != PlaybackState.STATE_PLAYING) return ps.position
+        val elapsed = SystemClock.elapsedRealtime() - ps.lastPositionUpdateTime
+        return ps.position + (elapsed * ps.playbackSpeed).toLong()
+    }
+
+    private fun hash16(text: String): String =
+        MessageDigest.getInstance("SHA-256").digest(text.toByteArray())
+            .joinToString("") { "%02x".format(it) }.take(16)
+
+    /** Scales the cover down and sends it as a JPEG. */
+    private fun sendArt(id: String, bmp: Bitmap) {
+        val target = sender ?: return
+        scope.launch(Dispatchers.Default) {
+            val scale = minOf(1f, ART_MAX_PX.toFloat() / maxOf(bmp.width, bmp.height))
+            val scaled = if (scale < 1f) {
+                Bitmap.createScaledBitmap(
+                    bmp,
+                    (bmp.width * scale).toInt().coerceAtLeast(1),
+                    (bmp.height * scale).toInt().coerceAtLeast(1),
+                    true,
+                )
+            } else bmp
+            val out = ByteArrayOutputStream()
+            scaled.compress(Bitmap.CompressFormat.JPEG, 85, out)
+            val bytes = out.toByteArray()
+            if (bytes.size > ART_MAX_BYTES) {
+                Status.event("media: cover art too large, skipped")
+                return@launch
+            }
+            target.send(
+                "media.art",
+                JSONObject().put("id", id).put("mime", "image/jpeg")
+                    .put("data", Base64.encodeToString(bytes, Base64.NO_WRAP))
+            )
+        }
     }
 
     // ---- Linux -> phone ----
@@ -206,12 +296,17 @@ class MediaPlugin(
     override fun onMessage(type: String, data: JSONObject) {
         when (type) {
             "media.state" -> showRemote(data)
-            "media.control" -> main.post { control(data.optString("action")) }
+            "media.art" -> receiveArt(data)
+            "media.control" -> {
+                val action = data.optString("action")
+                val position = data.optLong("position_ms", -1L)
+                main.post { control(action, position) }
+            }
         }
     }
 
     /** Operates the phone's player. Falls back to a media key when there is no session. */
-    private fun control(action: String) {
+    private fun control(action: String, positionMs: Long) {
         Status.event("media control from Linux: $action")
         val c = current
         if (c != null) {
@@ -223,6 +318,7 @@ class MediaPlugin(
                     if (c.playbackState?.state == PlaybackState.STATE_PLAYING) t.pause() else t.play()
                 "next" -> t.skipToNext()
                 "previous" -> t.skipToPrevious()
+                "seek" -> if (positionMs >= 0) t.seekTo(positionMs)
             }
             return
         }
@@ -239,40 +335,45 @@ class MediaPlugin(
         audio.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, key))
     }
 
-    /** Called from the notification buttons (via SyncService). */
-    fun sendControl(action: String?) {
+    /** Called from the system media controls and the notification buttons. */
+    fun sendControl(action: String?, positionMs: Long? = null) {
         if (action == null) return
-        sender?.send("media.control", JSONObject().put("action", action))
+        val data = JSONObject().put("action", action)
+        if (positionMs != null) data.put("position_ms", positionMs)
+        sender?.send("media.control", data)
     }
 
-    private fun showRemote(data: JSONObject) {
-        val status = data.optString("status", "stopped")
-        val title = data.optString("title")
-        if (status == "stopped" || title.isEmpty()) {
-            hideRemote()
-            Status.media = "received: nothing playing on Linux"
+    private fun receiveArt(data: JSONObject) {
+        val id = data.optString("id")
+        val encoded = data.optString("data")
+        if (id.isEmpty() || encoded.isEmpty()) return
+        val bytes = try {
+            Base64.decode(encoded, Base64.DEFAULT)
+        } catch (e: IllegalArgumentException) {
             return
         }
-        Status.media = "received: $title ($status)"
-        val artist = data.optString("artist")
-        val album = data.optString("album")
-        val text = listOf(artist, album).filter { it.isNotEmpty() }.joinToString(" - ")
-        val playing = status == "playing"
-        val duration = data.optLong("duration_ms", 0L)
-        val position = data.optLong("position_ms", 0L)
+        val bmp = decodeBitmap(bytes) ?: return
+        remoteArt = id to bmp
+        // The cover usually arrives right after the state, so show the track again with it
+        remoteState?.let { showRemote(it) }
+    }
 
-        // Update the session first: the system media controls are built from it
-        val metadata = MediaMetadata.Builder()
-            .putString(MediaMetadata.METADATA_KEY_TITLE, title)
-            .putString(MediaMetadata.METADATA_KEY_ARTIST, artist)
-            .putString(MediaMetadata.METADATA_KEY_ALBUM, album)
-        if (duration > 0) metadata.putLong(MediaMetadata.METADATA_KEY_DURATION, duration)
-        session.setMetadata(metadata.build())
+    private fun decodeBitmap(bytes: ByteArray): Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+        var sample = 1
+        while (maxOf(bounds.outWidth, bounds.outHeight) / sample > ART_MAX_PX * 2) sample *= 2
+        val options = BitmapFactory.Options().apply { inSampleSize = sample }
+        return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
+    }
+
+    private fun applyPlaybackState(playing: Boolean, position: Long) {
         session.setPlaybackState(
             PlaybackState.Builder()
                 .setActions(
                     PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or
-                        PlaybackState.ACTION_PLAY_PAUSE or
+                        PlaybackState.ACTION_PLAY_PAUSE or PlaybackState.ACTION_SEEK_TO or
                         PlaybackState.ACTION_SKIP_TO_NEXT or PlaybackState.ACTION_SKIP_TO_PREVIOUS
                 )
                 // With speed 1.0 the system advances the position by itself while playing
@@ -282,9 +383,44 @@ class MediaPlugin(
                 )
                 .build()
         )
+    }
+
+    private fun showRemote(data: JSONObject) {
+        val status = data.optString("status", "stopped")
+        val title = data.optString("title")
+        if (status == "stopped" || title.isEmpty()) {
+            remoteState = null
+            remotePlaying = false
+            hideRemote()
+            Status.media = "received: nothing playing on Linux"
+            return
+        }
+        remoteState = data
+        Status.media = "received: $title ($status)"
+        val artist = data.optString("artist")
+        val album = data.optString("album")
+        val text = listOf(artist, album).filter { it.isNotEmpty() }.joinToString(" - ")
+        val playing = status == "playing"
+        remotePlaying = playing
+        val duration = data.optLong("duration_ms", 0L)
+        val position = data.optLong("position_ms", 0L)
+        // Only use the cover if it belongs to this track
+        val artId = data.optString("art_id")
+        val art = remoteArt?.takeIf { artId.isNotEmpty() && it.first == artId }?.second
+
+        // Update the session first: the system media controls are built from it
+        val metadata = MediaMetadata.Builder()
+            .putString(MediaMetadata.METADATA_KEY_TITLE, title)
+            .putString(MediaMetadata.METADATA_KEY_ARTIST, artist)
+            .putString(MediaMetadata.METADATA_KEY_ALBUM, album)
+        // The seek bar needs a duration
+        if (duration > 0) metadata.putLong(MediaMetadata.METADATA_KEY_DURATION, duration)
+        if (art != null) metadata.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, art)
+        session.setMetadata(metadata.build())
+        applyPlaybackState(playing, position)
         session.isActive = true
 
-        val n = Notification.Builder(context, CHANNEL)
+        val builder = Notification.Builder(context, CHANNEL)
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setContentTitle(title)
             .setContentText(text)
@@ -302,8 +438,8 @@ class MediaPlugin(
                     .setMediaSession(session.sessionToken)
                     .setShowActionsInCompactView(0, 1, 2)
             )
-            .build()
-        nm.notify(NOTIFICATION_ID, n)
+        if (art != null) builder.setLargeIcon(art)
+        nm.notify(NOTIFICATION_ID, builder.build())
     }
 
     private fun action(icon: Int, label: String, name: String, requestCode: Int): Notification.Action {
@@ -321,5 +457,12 @@ class MediaPlugin(
         const val EXTRA_ACTION = "action"
         private const val CHANNEL = "bridge_media"
         private const val NOTIFICATION_ID = 2
+
+        // Cover art is scaled down to this size before sending, and dropped above the byte limit
+        private const val ART_MAX_PX = 512
+        private const val ART_MAX_BYTES = 600_000
+
+        // A position this far off the expected one is treated as a seek and re-sent
+        private const val DRIFT_MS = 1500L
     }
 }

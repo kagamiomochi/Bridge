@@ -26,13 +26,14 @@ Linux:
 - `wl-clipboard`
 - `openssl` (初回起動時の証明書生成に使います)
 - 任意: `playerctl` (再生中メディアの同期に使います。無い場合はメディア同期だけが無効になります)
+- 任意: `python-pillow` (アルバムアートを縮小して送るために使います。無い場合は、600 KB 以下の画像だけをそのまま送ります)
 - 任意: `python-zeroconf` (mDNS による自動検出。無くてもデーモンは動きますが、手動でアドレスを指定することになります)
 - 任意: `libnotify` (`notify-send`。ペアリングコードをデスクトップ通知で表示します)
 
 Arch 系の場合:
 
 ```
-sudo pacman -S python-websockets python-zeroconf wl-clipboard playerctl openssl libnotify
+sudo pacman -S python-websockets python-zeroconf wl-clipboard playerctl python-pillow openssl libnotify
 ```
 
 Android:
@@ -44,33 +45,6 @@ Android:
 ## セットアップ
 
 ### 1. Linux側
-
-```
-mkdir -p ~/.local/bin
-cp linux/bridge_daemon.py ~/.local/bin/
-chmod +x ~/.local/bin/bridge_daemon.py
-```
-
-手動で試すだけなら、次のように実行できます。
-
-```
-~/.local/bin/bridge_daemon.py
-```
-
-常駐させる場合は systemd のユーザーユニットとして登録します。
-
-```
-mkdir -p ~/.config/systemd/user
-cp linux/bridge.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now bridge
-```
-
-systemd 経由で起動する場合、`wl-paste` が Wayland のソケットを見つけられるよう、`WAYLAND_DISPLAY` がユーザーマネージャの環境に入っている必要があります。Hyprland の設定で、起動時に次を実行してください。
-
-```
-dbus-update-activation-environment --systemd WAYLAND_DISPLAY
-```
 
 ファイアウォールで次のポートを開けてください。
 
@@ -84,6 +58,21 @@ dbus-update-activation-environment --systemd WAYLAND_DISPLAY
 ```
 sudo ufw allow 8765/tcp
 sudo ufw allow 5353/udp
+```
+
+Releasesからダウンロードするか、リポジトリをクローンして`bridge_daemon.py`を実行してください。
+
+```
+python bridge_daemon.py
+```
+
+常駐させたい場合はHyprlandの`hl.exec_cmd`やSwayの`exec`等、環境にあった方法で自動起動するように設定してください。
+
+例 (Hyprland):
+```
+hl.on("hyprland.start", function()
+    hl.exec_cmd("python ~/Bridge/linux/bridge_daemon.py")
+end)
 ```
 
 ### 2. Android側
@@ -119,6 +108,8 @@ bridge_daemon.py --revoke ID    端末を取り消す (その端末は接続で�
 bridge_daemon.py --media        スマホで再生中の曲を表示する
 bridge_daemon.py --media-control ACTION
                                 スマホのプレイヤーを操作する (play / pause / play_pause / next / previous)
+bridge_daemon.py --media-seek SECONDS
+                                スマホのプレイヤーの再生位置を変える
 ```
 
 ## 設定とデータ
@@ -131,7 +122,7 @@ bridge_daemon.py --media-control ACTION
 | `cert.pem`, `key.pem` | 初回起動時に作られる自己署名証明書と秘密鍵 |
 | `devices.json` | ペアリング済み端末。トークン本体ではなくハッシュだけを保存 |
 
-`$XDG_RUNTIME_DIR/bridge-media.json` には、スマホで再生中の曲の最新状態が書き込まれます (後述)。
+`$XDG_RUNTIME_DIR/bridge-media.json` には、スマホで再生中の曲の最新状態が、`$XDG_RUNTIME_DIR/bridge-media-art.jpg` にはそのアルバムアートが書き込まれます (後述)。
 
 証明書を作り直すと、すべての端末で再ペアリングが必要になります。
 
@@ -152,8 +143,9 @@ WebSocket 上で、次の形式の JSON メッセージをやりとりします�
 | `pair.request` / `pair.challenge` / `pair.proof` / `pair.ok` / `pair.denied` | 双方 | ペアリング |
 | `hello` / `hello.ok` | 双方 | 接続時の認証 (端末ID とトークン) |
 | `clipboard.update` | 双方 | クリップボードの内容 (テキスト、最大1 MiB) |
-| `media.state` | 双方 | 再生中のメディアの状態 (`status` / `player` / `title` / `artist` / `album` / `duration_ms` / `position_ms`) |
-| `media.control` | 双方 | 相手側のプレイヤーの操作 (`action`: `play` / `pause` / `play_pause` / `next` / `previous`) |
+| `media.state` | 双方 | 再生中のメディアの状態 (`status` / `player` / `title` / `artist` / `album` / `duration_ms` / `position_ms` / `art_id`) |
+| `media.art` | 双方 | アルバムアート (`id` は `media.state` の `art_id` と対応、`mime`、`data` は Base64。曲ごとに1回送る) |
+| `media.control` | 双方 | 相手側のプレイヤーの操作 (`action`: `play` / `pause` / `play_pause` / `next` / `previous` / `seek`。`seek` のときは `position_ms` も付く) |
 
 ### セキュリティ
 
@@ -175,11 +167,11 @@ WebSocket 上で、次の形式の JSON メッセージをやりとりします�
 
 両方向で、再生中の曲の状態を送り合います。
 
-- Linux → スマホ: `playerctl` (MPRIS) で再生状態の変化を検知して送ります。スマホでは、Android 標準のメディアコントロール (通知センター、クイック設定のメディアカード、ロック画面) に曲名・アーティスト・再生位置が出て、前へ / 再生・一時停止 / 次への操作で Linux のプレイヤーを操作できます。Linux側が再生中の間は、Bluetooth イヤホンなどのメディアボタンも Linux のプレイヤーに届きます。
-- スマホ → Linux: スマホの再生中のメディアセッション (再生中のものを優先) を送ります。Linux側は最新の状態を `$XDG_RUNTIME_DIR/bridge-media.json` に書き出すので、waybar などのバーやスクリプトから読めます。`bridge_daemon.py --media` で表示、`bridge_daemon.py --media-control next` などで操作できます。
+- Linux → スマホ: `playerctl` (MPRIS) で再生状態の変化を検知して送ります。スマホでは、Android 標準のメディアコントロール (通知センター、クイック設定のメディアカード、ロック画面) に曲名・アーティスト・アルバムアート・シークバーが出て、前へ / 再生・一時停止 / 次への操作とシークで Linux のプレイヤーを操作できます。アルバムアートは、`file://` と `http(s)://` の URL のものを Linux 側で読み込み、512 px 以下の JPEG にして送ります。Linux側が再生中の間は、Bluetooth イヤホンなどのメディアボタンも Linux のプレイヤーに届きます。
+- スマホ → Linux: スマホの再生中のメディアセッション (再生中のものを優先) を送ります。Linux側は最新の状態を `$XDG_RUNTIME_DIR/bridge-media.json` に書き出すので、waybar などのバーやスクリプトから読めます。アルバムアートは `bridge-media-art.jpg` に保存され、状態ファイルの `art_path` で場所が分かります。`bridge_daemon.py --media` で表示、`bridge_daemon.py --media-control next` や `bridge_daemon.py --media-seek 90` などで操作できます。
 - Android: メディアセッションの読み取りには通知へのアクセス権 (`MediaListenerService`) が必要です。Shizuku 経由で自動的に有効にするので、設定画面を開く必要はありません。有効にならない場合は、設定の「通知へのアクセス」で Bridge を手動で許可してください。
 - 接続したときに、Linux で再生中なら現在の状態がすぐスマホに送られます。
-- 再生位置は状態の変化 (曲の切り替え、再生・一時停止など) のたびに送ります。シークだけでは再送しません。
+- 再生位置は、状態が変わるたびに送ります。そのほか、Linux側は 1.5 秒ごとに再生位置を確認し、予想から1.5秒以上ずれていたらシークとみなして再送します。スマホ側も同じ基準でずれを検出します。
 
 ### 自動再接続
 
@@ -256,7 +248,9 @@ Linux側の動作は、デーモンのログ (`journalctl --user -u bridge`) で
 
 - Linux側は Wayland (wl-clipboard) のみ対応です。メディア同期は MPRIS 対応のプレイヤーが対象です。
 - クリップボードはテキストのみで、最大1 MiB です。
-- メディアは、アルバムアートや再生位置のリアルタイム表示には対応していません。また、複数のプレイヤーが同時にあるとき、Linux側はどれを送るかを `playerctl` の既定の選び方に任せています (Android側は再生中のものを優先します)。
+- アルバムアートは、スマホ側ではアプリがメディア情報に画像そのものを入れている場合だけ送れます (画像の URL だけを渡すアプリのものは送れません)。Linux側は、プレイヤーが `file://` か `http(s)://` の URL を出している場合に対応します。
+- シークの反映には最大で1.5秒ほどかかります。シークに対応していないプレイヤーでは、シークバーを動かしても反映されません。
+- 複数のプレイヤーが同時にあるとき、Linux側はどれを送るかを `playerctl` の既定の選び方に任せています (Android側は再生中のものを優先します)。
 - スマホが記憶できるペアリング先は1台です (Linux側は複数の端末を登録できます)。
 - Android の内部クリップボード API はバージョンによって引数が違うため、型から引数を組み立てています。Android 14 以降の端末では、特に動作を確認してください。
 - 通信は IPv4 のみを想定しています。
