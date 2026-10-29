@@ -8,6 +8,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
+import android.os.Build
 import android.os.IBinder
 import android.os.SystemClock
 import kotlinx.coroutines.CompletableDeferred
@@ -50,16 +51,18 @@ class SyncService : Service() {
     private var skipInitialNetworkEvent = false
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
+    // The ongoing notification is shown only while authenticated and the service is alive
+    private val foregroundLock = Any()
+    private var connected = false
+    private var inForeground = false
+    private var destroyed = false
+    // Name of the paired device, shown in the notification
+    @Volatile private var peerName = ""
+
     override fun onCreate() {
         super.onCreate()
         val nm = getSystemService(NotificationManager::class.java)
-        nm.createNotificationChannel(NotificationChannel("bridge", "Bridge", NotificationManager.IMPORTANCE_MIN))
-        val n = Notification.Builder(this, "bridge")
-            .setContentTitle("Bridge")
-            .setContentText("Syncing with Linux")
-            .setSmallIcon(android.R.drawable.stat_notify_sync)
-            .build()
-        startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        nm.createNotificationChannel(NotificationChannel(CHANNEL_ID, "Bridge", NotificationManager.IMPORTANCE_MIN))
 
         shizuku = ShizukuClipboard(this)
         discovery = Discovery(this)
@@ -107,6 +110,63 @@ class SyncService : Service() {
         }
     }
 
+    private fun buildNotification(deferred: Boolean): Notification {
+        val builder = Notification.Builder(this, CHANNEL_ID)
+            .setContentTitle("Bridge")
+            .setContentText("Connected to ${peerName.ifEmpty { "Linux" }}")
+            .setSmallIcon(android.R.drawable.stat_notify_sync)
+        // Lets the system skip showing the notification if it is removed right away
+        if (deferred && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            builder.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_DEFERRED)
+        }
+        return builder.build()
+    }
+
+    /**
+     * Applies the connection state to the foreground state.
+     * Connected: foreground with the notification. Otherwise: no notification.
+     */
+    private fun applyForegroundState() = synchronized(foregroundLock) {
+        if (destroyed) return@synchronized
+        if (connected) {
+            try {
+                startForeground(
+                    NOTIFICATION_ID,
+                    buildNotification(deferred = false),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                )
+                inForeground = true
+            } catch (e: Exception) {
+                // The system may refuse to enter the foreground from the background
+                Status.event("could not show notification: ${e.message}")
+            }
+            return@synchronized
+        }
+        if (!inForeground) {
+            // startForegroundService() requires startForeground() to be called,
+            // so call it once and remove the notification right away
+            try {
+                startForeground(
+                    NOTIFICATION_ID,
+                    buildNotification(deferred = true),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                )
+            } catch (e: Exception) {
+                Status.event("could not enter foreground: ${e.message}")
+            }
+        }
+        runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+        inForeground = false
+    }
+
+    private fun setConnected(value: Boolean) {
+        synchronized(foregroundLock) {
+            if (connected == value) return
+            connected = value
+        }
+        applyForegroundState()
+    }
+
     /** Waits up to [ms]. Returns true if it was cut short by a network change. */
     private suspend fun pause(ms: Long): Boolean =
         withTimeoutOrNull(ms) { wake.receive() } != null
@@ -117,6 +177,8 @@ class SyncService : Service() {
             media.sendControl(intent.getStringExtra(MediaPlugin.EXTRA_ACTION))
             return START_STICKY
         }
+        // Started by startForegroundService(): must call startForeground() within a few seconds
+        if (intent != null) applyForegroundState()
         if (loop == null) {
             // Keep trying to bind Shizuku until it succeeds
             scope.launch {
@@ -214,6 +276,8 @@ class SyncService : Service() {
                     Status.event("authenticated")
                     val sender = Sender { t, d -> webSocket.send(envelope(t, d)) }
                     plugins.forEach { it.onConnected(sender) }
+                    peerName = pairing.serverName
+                    setConnected(true)
                     return
                 }
                 plugins.firstOrNull { type.startsWith(it.prefix + ".") }?.onMessage(type, data)
@@ -239,6 +303,7 @@ class SyncService : Service() {
             closed.await()
         } finally {
             currentSocket = null
+            setConnected(false)
             plugins.forEach { it.onDisconnected() }
             socket.cancel()
         }
@@ -247,6 +312,10 @@ class SyncService : Service() {
 
     override fun onDestroy() {
         networkCallback?.let { runCatching { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) } }
+        synchronized(foregroundLock) {
+            destroyed = true
+            connected = false
+        }
         scope.cancel()
         media.close()
         shizuku.unbind()
@@ -257,6 +326,8 @@ class SyncService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     private companion object {
+        const val CHANNEL_ID = "bridge"
+        const val NOTIFICATION_ID = 1
         const val BACKOFF_MIN_MS = 1_000L
         const val BACKOFF_MAX_MS = 30_000L
         const val STABLE_CONNECTION_MS = 10_000L
