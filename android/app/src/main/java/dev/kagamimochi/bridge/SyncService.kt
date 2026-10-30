@@ -21,6 +21,7 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -210,9 +211,17 @@ class SyncService : Service() {
                         failures++
                     } else {
                         val startedAt = SystemClock.elapsedRealtime()
-                        val authenticated = connectOnce(target, pairing)
+                        val outcome = connectOnce(target, pairing)
+                        val authenticated = outcome != Outcome.NOT_AUTHENTICATED
                         // The address may have changed, so search again next time
                         if (!authenticated) cached = null
+                        if (outcome == Outcome.SERVER_SHUTDOWN) {
+                            // The Linux side stopped on purpose (PC shutdown): do not retry,
+                            // wait until it announces itself again
+                            failures = 0
+                            cached = waitForServer(pairing)
+                            continue
+                        }
                         // A connection that dies right after authenticating still counts as a failure
                         val stable = authenticated &&
                             SystemClock.elapsedRealtime() - startedAt >= STABLE_CONNECTION_MS
@@ -244,10 +253,51 @@ class SyncService : Service() {
         return parts[0] to (parts.getOrNull(1)?.toIntOrNull() ?: 8765)
     }
 
-    /** Returns true if the connection reached the authenticated state. */
-    private suspend fun connectOnce(target: Pair<String, Int>, pairing: Pairing): Boolean {
+    /**
+     * Waits without retrying until the daemon shows up on mDNS again.
+     * One discovery runs for the whole wait, so a stale cache entry cannot start a retry loop.
+     * A network change restarts the discovery on the new network instead of ending the wait.
+     * Returns the address the daemon announced.
+     */
+    private suspend fun waitForServer(pairing: Pairing): Pair<String, Int> {
+        val prefix = pairing.fingerprint.take(16)
+        Status.connection = "Linux shut down, waiting for it to start"
+        Status.event("Linux closed the connection on purpose, standing by")
+        wake.tryReceive() // drop a network event that arrived before the wait started
+        var first = true
+        while (true) {
+            val appeared = Channel<Pair<String, Int>>(Channel.CONFLATED)
+            // Right after the shutdown the mDNS cache may still hold the old record: ignore it once
+            val readyAt = SystemClock.elapsedRealtime() + if (first) STANDBY_GRACE_MS else 0L
+            first = false
+            val stop = discovery.scan {
+                if (it.fpPrefix == prefix && SystemClock.elapsedRealtime() >= readyAt) {
+                    appeared.trySend(it.host to it.port)
+                }
+            }
+            try {
+                val target = select<Pair<String, Int>?> {
+                    appeared.onReceive { it }
+                    wake.onReceive { null }
+                }
+                if (target != null) {
+                    Status.event("Linux is back at ${target.first}:${target.second}")
+                    return target
+                }
+            } finally {
+                stop()
+            }
+            delay(NETWORK_SETTLE_MS)
+        }
+    }
+
+    private enum class Outcome { NOT_AUTHENTICATED, DISCONNECTED, SERVER_SHUTDOWN }
+
+    /** Tells how the connection ended: it never authenticated, it dropped, or the server closed it on purpose. */
+    private suspend fun connectOnce(target: Pair<String, Int>, pairing: Pairing): Outcome {
         val closed = CompletableDeferred<Unit>()
         var authenticated = false
+        var serverShutdown = false
         Status.connection = "connecting to ${target.first}:${target.second}"
 
         // Certificate pinning replaces the normal CA and hostname checks
@@ -284,6 +334,8 @@ class SyncService : Service() {
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                // Close code 1001 after authenticating means the daemon is stopping on purpose
+                if (authenticated && code == CLOSE_GOING_AWAY) serverShutdown = true
                 // Finish the close handshake; otherwise onClosed may not fire until a ping fails
                 webSocket.close(1000, null)
             }
@@ -307,7 +359,11 @@ class SyncService : Service() {
             plugins.forEach { it.onDisconnected() }
             socket.cancel()
         }
-        return authenticated
+        return when {
+            serverShutdown -> Outcome.SERVER_SHUTDOWN
+            authenticated -> Outcome.DISCONNECTED
+            else -> Outcome.NOT_AUTHENTICATED
+        }
     }
 
     override fun onDestroy() {
@@ -332,5 +388,7 @@ class SyncService : Service() {
         const val BACKOFF_MAX_MS = 30_000L
         const val STABLE_CONNECTION_MS = 10_000L
         const val NETWORK_SETTLE_MS = 500L
+        const val STANDBY_GRACE_MS = 3_000L
+        const val CLOSE_GOING_AWAY = 1001
     }
 }

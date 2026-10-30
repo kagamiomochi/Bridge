@@ -23,6 +23,7 @@ import logging
 import os
 import secrets
 import shutil
+import signal
 import socket
 import ssl
 import subprocess
@@ -51,6 +52,11 @@ CODE_LENGTH = 8
 PBKDF2_ITERATIONS = 100_000
 PAIR_WINDOW_SECONDS = 120
 PAIR_MAX_ATTEMPTS = 3
+
+# WebSocket close code 1001 ("going away"): sent when the daemon stops on purpose,
+# so the phone can tell a planned shutdown from a crash or a lost network.
+CLOSE_GOING_AWAY = 1001
+SHUTDOWN_CLOSE_TIMEOUT = 3.0
 
 log = logging.getLogger("bridge")
 
@@ -268,6 +274,21 @@ class Hub:
                     await ws.send(msg)
                 except websockets.ConnectionClosed:
                     pass
+
+    async def shutdown(self) -> None:
+        """Tells every connected phone that this is a planned shutdown (close code 1001)."""
+        clients = list(self.clients)
+        if not clients:
+            return
+        log.info("shutting down, notifying %d client(s)", len(clients))
+        closing = asyncio.gather(
+            *(ws.close(CLOSE_GOING_AWAY, "server shutting down") for ws in clients),
+            return_exceptions=True,
+        )
+        try:
+            await asyncio.wait_for(closing, SHUTDOWN_CLOSE_TIMEOUT)
+        except asyncio.TimeoutError:
+            log.warning("some clients did not finish the close handshake in time")
 
     def open_pairing(self) -> str:
         code = self.pairing.open()
@@ -934,15 +955,24 @@ async def main() -> None:
             hub.open_pairing()  # first run: nothing is paired yet
         else:
             log.info("%d paired device(s). Run `bridge_daemon.py --pair` to add another.", len(devices.all()))
+        # SIGTERM is what systemd and the session send on shutdown or logout
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            loop.add_signal_handler(sig, stop.set)
         try:
-            await asyncio.Future()
+            await stop.wait()
+            log.info("stop requested")
         finally:
             if watcher:
                 watcher.cancel()
             control.close()
             control_path().unlink(missing_ok=True)
+            # Withdraw the mDNS record first, so the phone does not see this
+            # machine as still available when it gets the close frame
             if zc:
                 await zc.async_close()
+            await hub.shutdown()
 
 
 if __name__ == "__main__":
