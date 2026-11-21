@@ -10,6 +10,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.text.InputType
+import android.view.View
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
@@ -28,11 +29,12 @@ import rikka.shizuku.Shizuku
 class MainActivity : Activity() {
 
     private lateinit var status: TextView
+    private lateinit var grant: Button
     private val handler = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private val discovery by lazy { Discovery(this) }
 
-    private val permListener = Shizuku.OnRequestPermissionResultListener { _, _ -> }
+    private val permListener = Shizuku.OnRequestPermissionResultListener { _, _ -> refresh() }
 
     // Refresh the status text once per second
     private val ticker = object : Runnable {
@@ -56,7 +58,7 @@ class MainActivity : Activity() {
             text = "Pair new device"
             setOnClickListener { showPairDialog() }
         }
-        val grant = Button(this).apply {
+        grant = Button(this).apply {
             text = "Grant Shizuku permission"
             setOnClickListener { if (Shizuku.pingBinder()) Shizuku.requestPermission(0) }
         }
@@ -192,9 +194,12 @@ class MainActivity : Activity() {
     }
 
     private fun refresh() {
+        val permissionGranted = Shizuku.pingBinder() &&
+            Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+        grant.visibility = if (permissionGranted) View.GONE else View.VISIBLE
         val shizuku = when {
             !Shizuku.pingBinder() -> "not running"
-            Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED -> "permission not granted"
+            !permissionGranted -> "permission not granted"
             else -> "ready"
         }
         val paired = Config.load(this).pairing?.serverName?.ifEmpty { "(unnamed)" } ?: "not paired"
