@@ -848,6 +848,151 @@ class MediaPlugin(Plugin):
                 await self._resync()  # confirm the real position to the phone right away
 
 
+class NotifyPlugin(Plugin):
+    """Notification sync from the phone to the desktop.
+
+    The phone sends `notify.posted` when a notification appears (and again when it
+    is updated), and `notify.removed` when the user dismisses it. Notifications are
+    shown with notify-send; the id it returns is kept so an update replaces the
+    previous bubble and a dismissal closes it.
+    """
+
+    prefix = "notify"
+    MAX_KEY = 256
+    MAX_APP = 128
+    MAX_TITLE = 512
+    MAX_TEXT = 4096
+    MAX_TRACKED = 200
+
+    def __init__(self):
+        self.available = shutil.which("notify-send") is not None
+        self.close_style = self._close_style()
+        self.replace_supported = True
+        # key -> (notification id, (app, title, text))
+        self.shown: dict[str, tuple[int, tuple[str, str, str]]] = {}
+        self.lock = asyncio.Lock()
+
+    @staticmethod
+    def _close_style() -> str | None:
+        """How to retract a notification when the phone dismisses it."""
+        if shutil.which("gdbus"):
+            return "gdbus"
+        if shutil.which("dbus-send"):
+            return "dbus-send"
+        return None
+
+    @staticmethod
+    def _text(value, limit: int) -> str:
+        if not isinstance(value, str):
+            return ""
+        # A NUL cannot appear in a subprocess argument
+        return value.replace("\x00", "").strip()[:limit]
+
+    async def start(self) -> None:
+        if not self.available:
+            log.warning("notify-send is not installed: notification plugin is disabled")
+        elif self.close_style is None:
+            log.info("gdbus/dbus-send not found: dismissed notifications stay on the desktop")
+
+    async def on_message(self, ws, type_: str, data: dict) -> None:
+        if not self.available or not isinstance(data, dict):
+            return
+        key = self._text(data.get("key"), self.MAX_KEY)
+        if not key:
+            return
+        async with self.lock:
+            if type_ == "notify.removed":
+                await self._close(key)
+            elif type_ == "notify.posted":
+                app = self._text(data.get("app"), self.MAX_APP) or "Android"
+                title = self._text(data.get("title"), self.MAX_TITLE)
+                text = self._text(data.get("text"), self.MAX_TEXT)
+                if not (title or text):
+                    return
+                await self._show(key, app, title or app, text)
+
+    async def _show(self, key: str, app: str, title: str, text: str) -> None:
+        signature = (app, title, text)
+        previous = self.shown.get(key)
+        if previous and previous[1] == signature:
+            return  # the phone repeated the same content
+        replace = previous[0] if previous else None
+        if replace is not None and not self.replace_supported:
+            # The installed notify-send has no --replace-id: close before showing the new one
+            await self._close_notification(replace)
+            replace = None
+        nid, err = await self._send(app, title, text, replace)
+        if nid is None and replace is not None and ("replace" in err.lower() or "option" in err.lower()):
+            # This notify-send has no --replace-id: close the old bubble and show a new one
+            self.replace_supported = False
+            await self._close_notification(replace)
+            nid, err = await self._send(app, title, text, None)
+        if nid is None:
+            log.debug("could not show notification from %r: %s", app, err.strip())
+            return
+        self.shown.pop(key, None)  # keep the dict in update order
+        self.shown[key] = (nid, signature)
+        if len(self.shown) > self.MAX_TRACKED:
+            oldest = next(iter(self.shown))
+            await self._close_notification(self.shown.pop(oldest)[0])
+        log.info("notification from %s: %s", app, title)
+
+    async def _send(self, app: str, title: str, text: str,
+                    replace_id: int | None = None) -> tuple[int | None, str]:
+        args = ["notify-send", "--app-name", app, "--print-id"]
+        if replace_id is not None:
+            args += ["--replace-id", str(replace_id)]
+        args += ["--", title, text]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            out, err = await asyncio.wait_for(proc.communicate(), 5)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return None, "notify-send timed out"
+        except OSError as e:
+            return None, str(e)
+        if proc.returncode != 0:
+            return None, err.decode(errors="replace")
+        try:
+            return int(out.decode().strip().splitlines()[-1]), ""
+        except (ValueError, IndexError):
+            return None, "notify-send did not print an id"
+
+    async def _close(self, key: str) -> None:
+        entry = self.shown.pop(key, None)
+        if entry:
+            await self._close_notification(entry[0])
+
+    async def _close_notification(self, nid: int) -> None:
+        if self.close_style == "gdbus":
+            args = [
+                "gdbus", "call", "--session", "--dest", "org.freedesktop.Notifications",
+                "--object-path", "/org/freedesktop/Notifications",
+                "--method", "org.freedesktop.Notifications.CloseNotification", str(nid),
+            ]
+        elif self.close_style == "dbus-send":
+            args = [
+                "dbus-send", "--session", "--type=method_call",
+                "--dest=org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+                "org.freedesktop.Notifications.CloseNotification", f"uint32:{nid}",
+            ]
+        else:
+            return
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), 2)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+        except OSError:
+            pass
+
+
 def run_cli(argv: list[str]) -> bool:
     """Handle management commands. Returns True if one was handled."""
     if "--pair" in argv:
@@ -939,6 +1084,7 @@ async def main() -> None:
     # Register new features here
     hub.register(ClipboardPlugin())
     hub.register(MediaPlugin())
+    hub.register(NotifyPlugin())
     for p in hub.plugins.values():
         await p.start()
 

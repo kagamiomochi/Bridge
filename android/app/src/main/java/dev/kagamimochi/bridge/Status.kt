@@ -12,6 +12,7 @@ object Status {
     @Volatile var lastEvent = "-"
     @Volatile var retry = ""
     @Volatile var media = "-"
+    @Volatile var notifications = "-"
 
     fun event(message: String) {
         val time = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())

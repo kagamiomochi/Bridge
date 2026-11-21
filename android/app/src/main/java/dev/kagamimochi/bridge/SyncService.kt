@@ -71,6 +71,7 @@ class SyncService : Service() {
         plugins += ClipboardPlugin(shizuku, scope)
         media = MediaPlugin(this, shizuku, scope)
         plugins += media
+        plugins += NotificationPlugin(this, shizuku, scope)
         watchNetwork()
     }
 

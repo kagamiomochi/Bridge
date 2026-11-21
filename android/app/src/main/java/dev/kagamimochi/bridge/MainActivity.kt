@@ -204,6 +204,7 @@ class MainActivity : Activity() {
             "Connection: ${Status.connection}\n" +
             "Next retry: ${Status.retry.ifEmpty { "-" }}\n" +
             "Media: ${Status.media}\n" +
+            "Notifications: ${Status.notifications}\n" +
             "Last event: ${Status.lastEvent}"
     }
 

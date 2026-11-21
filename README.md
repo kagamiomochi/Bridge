@@ -1,6 +1,6 @@
 # Bridge
 
-LinuxとAndroidをつなぐ連携ソフトです。現在の機能はクリップボード同期と再生中メディアの同期で、機能追加はプラグインとして足せる設計になっています。
+LinuxとAndroidをつなぐ連携ソフトです。現在の機能はクリップボード同期、再生中メディアの同期、スマホの通知のデスクトップ表示で、機能追加はプラグインとして足せる設計になっています。
 
 - 通信は TLS (wss) で暗号化され、ペアリング済みの端末だけが接続できます
 - 接続先は mDNS で自動検出されます(IPアドレスの入力は不要)
@@ -28,7 +28,7 @@ Linux:
 - 任意: `playerctl` (再生中メディアの同期に使います。無い場合はメディア同期だけが無効になります)
 - 任意: `python-pillow` (アルバムアートを縮小して送るために使います。無い場合は、600 KB 以下の画像だけをそのまま送ります)
 - 任意: `python-zeroconf` (mDNS による自動検出。無くてもデーモンは動きますが、手動でアドレスを指定することになります)
-- 任意: `libnotify` (`notify-send`。ペアリングコードをデスクトップ通知で表示します)
+- 任意: `libnotify` (`notify-send`。ペアリングコードの表示と、スマホの通知の表示に使います)
 
 Arch 系の場合:
 
@@ -146,6 +146,8 @@ WebSocket 上で、次の形式の JSON メッセージをやりとりします�
 | `media.state` | 双方 | 再生中のメディアの状態 (`status` / `player` / `title` / `artist` / `album` / `duration_ms` / `position_ms` / `art_id`) |
 | `media.art` | 双方 | アルバムアート (`id` は `media.state` の `art_id` と対応、`mime`、`data` は Base64。曲ごとに1回送る) |
 | `media.control` | 双方 | 相手側のプレイヤーの操作 (`action`: `play` / `pause` / `play_pause` / `next` / `previous` / `seek`。`seek` のときは `position_ms` も付く) |
+| `notify.posted` | スマホ → Linux | 通知の内容 (`key` / `app` / `title` / `text` / `time`)。同じ `key` の再送は更新として扱う |
+| `notify.removed` | スマホ → Linux | 通知が消された (`key` に対応するデスクトップ通知を閉じる) |
 
 ### セキュリティ
 
@@ -169,9 +171,19 @@ WebSocket 上で、次の形式の JSON メッセージをやりとりします�
 
 - Linux → スマホ: `playerctl` (MPRIS) で再生状態の変化を検知して送ります。スマホでは、Android 標準のメディアコントロール (通知センター、クイック設定のメディアカード、ロック画面) に曲名・アーティスト・アルバムアート・シークバーが出て、前へ / 再生・一時停止 / 次への操作とシークで Linux のプレイヤーを操作できます。アルバムアートは、`file://` と `http(s)://` の URL のものを Linux 側で読み込み、512 px 以下の JPEG にして送ります。Linux側が再生中の間は、Bluetooth イヤホンなどのメディアボタンも Linux のプレイヤーに届きます。
 - スマホ → Linux: スマホの再生中のメディアセッション (再生中のものを優先) を送ります。Linux側は最新の状態を `$XDG_RUNTIME_DIR/bridge-media.json` に書き出すので、waybar などのバーやスクリプトから読めます。アルバムアートは `bridge-media-art.jpg` に保存され、状態ファイルの `art_path` で場所が分かります。`bridge_daemon.py --media` で表示、`bridge_daemon.py --media-control next` や `bridge_daemon.py --media-seek 90` などで操作できます。
-- Android: メディアセッションの読み取りには通知へのアクセス権 (`MediaListenerService`) が必要です。Shizuku 経由で自動的に有効にするので、設定画面を開く必要はありません。有効にならない場合は、設定の「通知へのアクセス」で Bridge を手動で許可してください。
+- Android: メディアセッションの読み取りには通知へのアクセス権 (`BridgeListenerService`) が必要です。Shizuku 経由で自動的に有効にするので、設定画面を開く必要はありません。有効にならない場合は、設定の「通知へのアクセス」で Bridge を手動で許可してください。
 - 接続したときに、Linux で再生中なら現在の状態がすぐスマホに送られます。
 - 再生位置は、状態が変わるたびに送ります。そのほか、Linux側は 1.5 秒ごとに再生位置を確認し、予想から1.5秒以上ずれていたらシークとみなして再送します。スマホ側も同じ基準でずれを検出します。
+
+### 通知の同期
+
+スマホに出た通知を、Linux のデスクトップ通知として表示します。
+
+- Android: `BridgeListenerService` (通知へのアクセス) で通知の投稿と削除を受け取り、`notify.posted` / `notify.removed` を送ります。通知へのアクセスは Shizuku 経由で自動的に有効になるので、設定画面を開く必要はありません。
+- Linux: `notify-send` で表示します。同じ通知が更新されたときは、同じ吹き出しを置き換えます。スマホ側で通知を消す (アプリで開く、スワイプするなど) と、`gdbus` または `dbus-send` でデスクトップ側の吹き出しも閉じます。
+- 送るのは、ユーザーが消せる通知だけです。メディアプレイヤーやダウンロードなどの継続中の通知、グループの要約 (summary) は、重複やノイズを避けるため送りません。メディアは「再生中メディアの同期」で別に扱います。
+- 通知の操作ボタン (返信など) やアイコンは同期しません。タイトルと本文だけです。
+- 接続していない間に届いた通知は送りません。接続後に届いたものから同期します。
 
 ### 自動再接続
 
@@ -198,25 +210,25 @@ WebSocket 上で、次の形式の JSON メッセージをやりとりします�
 Linux側は `Plugin` を継承して `hub.register(...)` で登録します。
 
 ```python
-class NotifyPlugin(Plugin):
-    prefix = "notify"  # owns all "notify.*" messages
+class PingPlugin(Plugin):
+    prefix = "ping"  # owns all "ping.*" messages
 
     async def on_message(self, ws, type_, data):
-        if type_ == "notify.show":
-            await notify(data.get("title", ""), data.get("body", ""))
+        if type_ == "ping.hello":
+            await self.hub.broadcast("ping.hello", {"from": "linux"})
 
 # in main():
-hub.register(NotifyPlugin())
+hub.register(PingPlugin())
 ```
 
 Android側は `BridgePlugin` を実装して、`SyncService` の `plugins +=` に足します。
 
 ```kotlin
-class NotifyPlugin : BridgePlugin {
-    override val prefix = "notify"
+class PingPlugin : BridgePlugin {
+    override val prefix = "ping"
 
     override fun onConnected(sender: Sender) {
-        // Send messages with sender.send("notify.show", JSONObject()...)
+        // Send messages with sender.send("ping.hello", JSONObject()...)
     }
 
     override fun onMessage(type: String, data: JSONObject) {
@@ -225,12 +237,12 @@ class NotifyPlugin : BridgePlugin {
 }
 
 // in SyncService.onCreate():
-plugins += NotifyPlugin()
+plugins += PingPlugin()
 ```
 
 ## トラブルシューティング
 
-アプリのトップ画面に、状態が4行で出ます。
+アプリのトップ画面に状態が出ます。
 
 | 表示 | 意味と対処 |
 | --- | --- |
@@ -242,8 +254,9 @@ plugins += NotifyPlugin()
 | `Connection: failed: ...` | Linuxに届いていません。TCP 8765 とデーモンの起動を確認してください |
 | `Connection: closed (4401 ...)` | 端末が取り消されたか、ペアリング情報が一致しません。再ペアリングしてください |
 | `Media: waiting for listener permission` (Last event) | 通知へのアクセス権がまだ有効になっていません。Shizuku が起動していれば自動で有効になります。ならない場合は設定の「通知へのアクセス」で Bridge を許可してください |
+| `Notifications: waiting for listener permission` | 同上。通知の同期に使う通知へのアクセス権がまだ有効になっていません |
 
-Linux側の動作は、デーモンのログ (`journalctl --user -u bridge`) で確認できます。クリップボードが変わるたびに `local clipboard changed` と `received clipboard from client` が出ます。
+Linux側の動作は、デーモンのログ (`journalctl --user -u bridge`) で確認できます。クリップボードが変わるたびに `local clipboard changed` と `received clipboard from client`、通知が届くたびに `notification from ...` が出ます。
 
 ## 制限事項
 
@@ -253,5 +266,8 @@ Linux側の動作は、デーモンのログ (`journalctl --user -u bridge`) で
 - シークの反映には最大で1.5秒ほどかかります。シークに対応していないプレイヤーでは、シークバーを動かしても反映されません。
 - 複数のプレイヤーが同時にあるとき、Linux側はどれを送るかを `playerctl` の既定の選び方に任せています (Android側は再生中のものを優先します)。
 - スマホが記憶できるペアリング先は1台です (Linux側は複数の端末を登録できます)。
+- 通知の同期はスマホ → Linux の一方向です。Linux側で消した通知はスマホ側には残ります。通知の操作ボタン、アイコン、返信には対応しません。
+- 継続中の通知 (メディア、ダウンロード、常駐サービスなど)、グループの要約、ユーザーが消せない通知は送りません。
+- アプリ名は、Android のパッケージ可視性の制限で取得できない場合、パッケージ名のまま表示されます。
 - Android の内部クリップボード API はバージョンによって引数が違うため、型から引数を組み立てています。Android 14 以降の端末では、特に動作を確認してください。
 - 通信は IPv4 のみを想定しています。

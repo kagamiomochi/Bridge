@@ -4,7 +4,6 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
-import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
@@ -19,7 +18,6 @@ import android.media.session.PlaybackState
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
-import android.provider.Settings
 import android.util.Base64
 import android.view.KeyEvent
 import kotlinx.coroutines.CoroutineScope
@@ -52,7 +50,7 @@ class MediaPlugin(
     override val prefix = "media"
 
     private val main = Handler(Looper.getMainLooper())
-    private val listener = ComponentName(context, MediaListenerService::class.java)
+    private val listener = BridgeListenerService.component(context)
     private val sessions = context.getSystemService(MediaSessionManager::class.java)
     private val nm = context.getSystemService(NotificationManager::class.java)
 
@@ -122,8 +120,10 @@ class MediaPlugin(
             // The listener may not be effective right after it was enabled, so retry until it works
             while (isActive) {
                 if (!attached) {
-                    if (!listenerEnabled()) shizuku.enableNotificationListener(listener.flattenToString())
-                    if (listenerEnabled()) withContext(Dispatchers.Main) { attach() }
+                    if (!BridgeListenerService.isEnabled(context)) {
+                        shizuku.enableNotificationListener(listener.flattenToString())
+                    }
+                    if (BridgeListenerService.isEnabled(context)) withContext(Dispatchers.Main) { attach() }
                 }
                 delay(5000)
             }
@@ -156,11 +156,6 @@ class MediaPlugin(
         } catch (e: SecurityException) {
             null // permission was revoked; the next attach attempt will report it
         }
-
-    private fun listenerEnabled(): Boolean {
-        val enabled = Settings.Secure.getString(context.contentResolver, "enabled_notification_listeners")
-        return enabled?.split(":")?.contains(listener.flattenToString()) == true
-    }
 
     private fun attach() {
         if (attached) return
