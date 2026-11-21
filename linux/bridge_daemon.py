@@ -388,7 +388,7 @@ async def notify(title: str, body: str) -> None:
     if not shutil.which("notify-send"):
         return
     proc = await asyncio.create_subprocess_exec(
-        "notify-send", "-t", "120000", title, body,
+        "notify-send", "-t", "120000", "-h", "string:x-bridge-origin:bridge", title, body,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
     )
     await proc.wait()
@@ -849,12 +849,15 @@ class MediaPlugin(Plugin):
 
 
 class NotifyPlugin(Plugin):
-    """Notification sync from the phone to the desktop.
+    """Notification sync in both directions.
 
-    The phone sends `notify.posted` when a notification appears (and again when it
-    is updated), and `notify.removed` when the user dismisses it. Notifications are
-    shown with notify-send; the id it returns is kept so an update replaces the
-    previous bubble and a dismissal closes it.
+    Phone -> desktop: the phone sends `notify.posted` when a notification appears
+    (and again when it is updated), and `notify.removed` when the user dismisses
+    it. Notifications are shown with notify-send; the id it returns is kept so an
+    update replaces the previous bubble and a dismissal closes it.
+
+    Desktop -> phone: `busctl` watches the session bus for Notify and close
+    messages, and the same message types are broadcast to the phone.
     """
 
     prefix = "notify"
@@ -863,6 +866,8 @@ class NotifyPlugin(Plugin):
     MAX_TITLE = 512
     MAX_TEXT = 4096
     MAX_TRACKED = 200
+    ORIGIN_HINT = "x-bridge-origin"
+    ORIGIN_ANDROID = "android"
 
     def __init__(self):
         self.available = shutil.which("notify-send") is not None
@@ -871,6 +876,11 @@ class NotifyPlugin(Plugin):
         # key -> (notification id, (app, title, text))
         self.shown: dict[str, tuple[int, tuple[str, str, str]]] = {}
         self.lock = asyncio.Lock()
+        # Linux -> phone: notifications seen on the session bus
+        self.busctl = shutil.which("busctl") is not None
+        self.pending: dict[tuple[str | None, int], str] = {}  # (sender, cookie) -> key
+        self.by_id: dict[int, str] = {}                       # desktop notification id -> key
+        self.local: dict[str, tuple[str, str, str]] = {}      # key -> (app, title, text)
 
     @staticmethod
     def _close_style() -> str | None:
@@ -890,9 +900,13 @@ class NotifyPlugin(Plugin):
 
     async def start(self) -> None:
         if not self.available:
-            log.warning("notify-send is not installed: notification plugin is disabled")
+            log.warning("notify-send is not installed: phone -> Linux notifications are disabled")
         elif self.close_style is None:
             log.info("gdbus/dbus-send not found: dismissed notifications stay on the desktop")
+        if self.busctl:
+            asyncio.create_task(self._watch_local())
+        else:
+            log.info("busctl not found: Linux notifications are not sent to the phone")
 
     async def on_message(self, ws, type_: str, data: dict) -> None:
         if not self.available or not isinstance(data, dict):
@@ -910,6 +924,137 @@ class NotifyPlugin(Plugin):
                 if not (title or text):
                     return
                 await self._show(key, app, title or app, text)
+
+    # ---- Linux -> phone ----
+
+    async def _watch_local(self) -> None:
+        """Sends desktop notifications to the phone by watching the session bus.
+
+        busctl's JSON output carries the full argument list, so `Notify`,
+        `CloseNotification` and `NotificationClosed` can be read without guessing
+        at dbus-monitor's text format. The id returned by Notify is matched through
+        the reply cookie, so updates and dismissals reach the same Android
+        notification.
+        """
+        matches = [
+            "--match=type='method_call',interface='org.freedesktop.Notifications',member='Notify'",
+            "--match=type='method_call',interface='org.freedesktop.Notifications',member='CloseNotification'",
+            "--match=type='signal',interface='org.freedesktop.Notifications',member='NotificationClosed'",
+            "--match=type='method_return',sender='org.freedesktop.Notifications'",
+        ]
+        warned = False
+        while True:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "busctl", "--user", "monitor", "--json=short", *matches,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                )
+            except OSError as e:
+                log.warning("could not start busctl monitor: %s", e)
+                return
+            async for raw in proc.stdout:
+                warned = False
+                try:
+                    msg = json.loads(raw)
+                except ValueError:
+                    continue
+                await self._handle_local(msg)
+            await proc.wait()
+            if not warned:
+                log.warning("busctl monitor exited, restarting")
+                warned = True
+            await asyncio.sleep(2)
+
+    async def _handle_local(self, msg: dict) -> None:
+        kind = msg.get("type")
+        payload = msg.get("payload")
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, list):
+            return
+
+        if kind == "method_call" and msg.get("interface") == "org.freedesktop.Notifications":
+            member = msg.get("member")
+            if member == "Notify":
+                await self._local_posted(msg, data)
+            elif member == "CloseNotification" and data:
+                await self._local_closed(data[0])
+        elif kind == "method_return":
+            # Match the reply to the Notify call that produced it
+            pending = (msg.get("destination"), msg.get("reply_cookie"))
+            key = self.pending.pop(pending, None)
+            if key and data and self._is_id(data[0]):
+                self.by_id[data[0]] = key
+                if len(self.by_id) > self.MAX_TRACKED:
+                    self.by_id.pop(next(iter(self.by_id)))
+        elif (kind == "signal"
+              and msg.get("interface") == "org.freedesktop.Notifications"
+              and msg.get("member") == "NotificationClosed" and data):
+            await self._local_closed(data[0])
+
+    @staticmethod
+    def _is_id(value) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+    async def _local_posted(self, msg: dict, data: list) -> None:
+        if len(data) < 8:
+            return
+        app, rid, _icon, title, body, _actions, hints, _timeout = data[:8]
+        if not isinstance(hints, dict):
+            hints = {}
+        # Bridge's own notifications (the phone's notifications shown here, and
+        # pairing codes) must not travel back to the phone
+        if self.ORIGIN_HINT in hints:
+            return
+        if not self._is_id(rid):
+            rid = 0
+        app = self._text(app, self.MAX_APP) or "Linux"
+        title = self._text(title, self.MAX_TITLE)
+        text = self._text(body, self.MAX_TEXT)
+        if not (title or text):
+            return
+
+        key = self.by_id.get(rid) if rid else None
+        if key is None or key not in self.local:
+            key = secrets.token_hex(8)
+        # Remember the call so the id in the method return can be mapped to this key
+        cookie = msg.get("cookie")
+        if isinstance(cookie, int) and not isinstance(cookie, bool):
+            self.pending[(msg.get("sender"), cookie)] = key
+            if len(self.pending) > self.MAX_TRACKED:
+                self.pending.pop(next(iter(self.pending)))
+
+        signature = (app, title, text)
+        if self.local.get(key) == signature:
+            return  # the app repeated the same content
+        self.local[key] = signature
+        if len(self.local) > self.MAX_TRACKED:
+            oldest = next(iter(self.local))
+            del self.local[oldest]
+            self.by_id = {i: k for i, k in self.by_id.items() if k != oldest}
+            if self.hub.clients:
+                await self.hub.broadcast("notify.removed", {"key": oldest})
+        if self.hub.clients:
+            log.info("local notification to phone: %s - %s", app, title)
+            await self.hub.broadcast("notify.posted", {
+                "key": key, "app": app, "title": title or app, "text": text,
+                "time": int(time.time() * 1000),
+            })
+
+    async def _local_closed(self, nid) -> None:
+        if not self._is_id(nid):
+            return
+        key = self.by_id.pop(nid, None)
+        if key is None:
+            return
+        # A newer id may still stand for the same notification (the daemon
+        # sometimes assigns a new id when replaces_id no longer exists)
+        if key in self.by_id.values():
+            return
+        self.local.pop(key, None)
+        if self.hub.clients:
+            await self.hub.broadcast("notify.removed", {"key": key})
+
+    # ---- phone -> Linux ----
 
     async def _show(self, key: str, app: str, title: str, text: str) -> None:
         signature = (app, title, text)
@@ -939,7 +1084,11 @@ class NotifyPlugin(Plugin):
 
     async def _send(self, app: str, title: str, text: str,
                     replace_id: int | None = None) -> tuple[int | None, str]:
-        args = ["notify-send", "--app-name", app, "--print-id"]
+        args = [
+            "notify-send", "--app-name", app, "--print-id",
+            # Lets the local watcher ignore notifications Bridge itself displayed
+            "--hint", f"string:{self.ORIGIN_HINT}:{self.ORIGIN_ANDROID}",
+        ]
         if replace_id is not None:
             args += ["--replace-id", str(replace_id)]
         args += ["--", title, text]

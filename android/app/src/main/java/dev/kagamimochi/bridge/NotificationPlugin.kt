@@ -1,6 +1,8 @@
 package dev.kagamimochi.bridge
 
 import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.Context
 import android.service.notification.StatusBarNotification
 import kotlinx.coroutines.CoroutineScope
@@ -11,17 +13,22 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Notification sync from the phone to Linux.
+ * Notification sync in both directions.
  *
- * A posted (or updated) notification is sent as `notify.posted`; when the user
- * dismisses it, `notify.removed` follows. Linux shows it with notify-send and
- * closes the bubble again on removal.
+ * Phone -> Linux: a posted (or updated) notification is sent as `notify.posted`,
+ * and `notify.removed` follows when the user dismisses it. Linux shows it with
+ * notify-send and closes the bubble again on removal.
  *
- * Only notifications the user can dismiss are mirrored. Ongoing notifications
- * (media players, downloads, foreground services) and group summaries are left
- * out: media already has its own plugin, and summaries repeat their children.
+ * Linux -> phone: notifications from the desktop arrive as `notify.posted` and
+ * are shown with the system notification UI; `notify.removed` cancels them.
+ *
+ * Only notifications the user can dismiss are mirrored to Linux. Ongoing
+ * notifications (media players, downloads, foreground services) and group
+ * summaries are left out: media already has its own plugin, and summaries repeat
+ * their children.
  */
 class NotificationPlugin(
     private val context: Context,
@@ -31,12 +38,23 @@ class NotificationPlugin(
 
     override val prefix = "notify"
 
+    private val nm = context.getSystemService(NotificationManager::class.java)
     @Volatile private var sender: Sender? = null
     private var job: Job? = null
+
+    // Notification ids for what Linux sent, so updates replace and removals cancel
+    private val remoteIds = ConcurrentHashMap<String, Int>()
+    private val nextRemoteId = AtomicInteger(REMOTE_ID_BASE)
 
     // Keys that were sent, so a removal is not reported for something Linux never saw
     private val sent = LinkedHashSet<String>()
     private val labels = ConcurrentHashMap<String, String>()
+
+    init {
+        nm.createNotificationChannel(
+            NotificationChannel(CHANNEL, "Linux notifications", NotificationManager.IMPORTANCE_DEFAULT)
+        )
+    }
 
     private fun remember(key: String) = synchronized(sent) {
         sent.remove(key)
@@ -74,7 +92,48 @@ class NotificationPlugin(
     }
 
     override fun onMessage(type: String, data: JSONObject) {
-        // Linux cannot dismiss a phone notification from the desktop (yet)
+        when (type) {
+            "notify.posted" -> showRemote(data)
+            "notify.removed" -> hideRemote(data.optString("key"))
+        }
+    }
+
+    /** Shows a notification that Linux posted. */
+    private fun showRemote(data: JSONObject) {
+        val key = data.optString("key").take(MAX_KEY)
+        if (key.isEmpty()) return
+        val app = data.optString("app").ifEmpty { "Linux" }.take(MAX_APP)
+        val title = data.optString("title").ifEmpty { app }.take(MAX_TITLE)
+        val text = data.optString("text").take(MAX_TEXT)
+        val previous = remoteIds[key]
+        val id = previous ?: nextRemoteId.getAndIncrement().also { remoteIds[key] = it }
+        val builder = Notification.Builder(context, CHANNEL)
+            .setSmallIcon(R.drawable.ic_stat_notify)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setSubText(app)
+            .setWhen(data.optLong("time", System.currentTimeMillis()))
+            .setShowWhen(true)
+            .setAutoCancel(true)
+            // An update should not ring or vibrate again
+            .setOnlyAlertOnce(previous != null)
+        if (text.isNotEmpty()) {
+            builder.setStyle(Notification.BigTextStyle().bigText(text))
+        }
+        nm.notify(id, builder.build())
+        Status.event("received notification from Linux: $app - $title")
+    }
+
+    /** Cancels a notification when Linux dismissed or it expired there. */
+    private fun hideRemote(key: String) {
+        val id = remoteIds.remove(key) ?: return
+        nm.cancel(id)
+    }
+
+    /** Releases the mirrored notifications. Called when the service is destroyed. */
+    fun close() {
+        remoteIds.values.toList().forEach { nm.cancel(it) }
+        remoteIds.clear()
     }
 
     override fun onPosted(sbn: StatusBarNotification) {
@@ -137,6 +196,9 @@ class NotificationPlugin(
     }
 
     private companion object {
+        const val CHANNEL = "bridge_notifications"
+        // Keep clear of SyncService (1) and MediaPlugin (2)
+        const val REMOTE_ID_BASE = 1000
         const val MAX_KEY = 256
         const val MAX_APP = 128
         const val MAX_TITLE = 512

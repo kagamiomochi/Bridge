@@ -1,6 +1,6 @@
 # Bridge
 
-LinuxとAndroidをつなぐ連携ソフトです。現在の機能はクリップボード同期、再生中メディアの同期、スマホの通知のデスクトップ表示で、機能追加はプラグインとして足せる設計になっています。
+LinuxとAndroidをつなぐ連携ソフトです。現在の機能はクリップボード同期、再生中メディアの同期、通知の同期 (双方向) で、機能追加はプラグインとして足せる設計になっています。
 
 - 通信は TLS (wss) で暗号化され、ペアリング済みの端末だけが接続できます
 - 接続先は mDNS で自動検出されます(IPアドレスの入力は不要)
@@ -29,6 +29,7 @@ Linux:
 - 任意: `python-pillow` (アルバムアートを縮小して送るために使います。無い場合は、600 KB 以下の画像だけをそのまま送ります)
 - 任意: `python-zeroconf` (mDNS による自動検出。無くてもデーモンは動きますが、手動でアドレスを指定することになります)
 - 任意: `libnotify` (`notify-send`。ペアリングコードの表示と、スマホの通知の表示に使います)
+- 任意: `busctl` (systemd に含まれる D-Bus ツール。Linux の通知をスマホに送るために使います。無い場合はスマホ → Linux 方向だけが有効になります)
 
 Arch 系の場合:
 
@@ -146,8 +147,8 @@ WebSocket 上で、次の形式の JSON メッセージをやりとりします�
 | `media.state` | 双方 | 再生中のメディアの状態 (`status` / `player` / `title` / `artist` / `album` / `duration_ms` / `position_ms` / `art_id`) |
 | `media.art` | 双方 | アルバムアート (`id` は `media.state` の `art_id` と対応、`mime`、`data` は Base64。曲ごとに1回送る) |
 | `media.control` | 双方 | 相手側のプレイヤーの操作 (`action`: `play` / `pause` / `play_pause` / `next` / `previous` / `seek`。`seek` のときは `position_ms` も付く) |
-| `notify.posted` | スマホ → Linux | 通知の内容 (`key` / `app` / `title` / `text` / `time`)。同じ `key` の再送は更新として扱う |
-| `notify.removed` | スマホ → Linux | 通知が消された (`key` に対応するデスクトップ通知を閉じる) |
+| `notify.posted` | 双方 | 通知の内容 (`key` / `app` / `title` / `text` / `time`)。同じ `key` の再送は更新として扱う |
+| `notify.removed` | 双方 | 通知が消された (`key` に対応する相手側の通知を閉じる) |
 
 ### セキュリティ
 
@@ -177,12 +178,13 @@ WebSocket 上で、次の形式の JSON メッセージをやりとりします�
 
 ### 通知の同期
 
-スマホに出た通知を、Linux のデスクトップ通知として表示します。
+スマホの通知を Linux に出し、Linux の通知をスマホに出す、双方向の同期です。
 
-- Android: `BridgeListenerService` (通知へのアクセス) で通知の投稿と削除を受け取り、`notify.posted` / `notify.removed` を送ります。通知へのアクセスは Shizuku 経由で自動的に有効になるので、設定画面を開く必要はありません。
-- Linux: `notify-send` で表示します。同じ通知が更新されたときは、同じ吹き出しを置き換えます。スマホ側で通知を消す (アプリで開く、スワイプするなど) と、`gdbus` または `dbus-send` でデスクトップ側の吹き出しも閉じます。
-- 送るのは、ユーザーが消せる通知だけです。メディアプレイヤーやダウンロードなどの継続中の通知、グループの要約 (summary) は、重複やノイズを避けるため送りません。メディアは「再生中メディアの同期」で別に扱います。
-- 通知の操作ボタン (返信など) やアイコンは同期しません。タイトルと本文だけです。
+- スマホ → Linux: `BridgeListenerService` (通知へのアクセス) で通知の投稿と削除を受け取り、`notify.posted` / `notify.removed` を送ります。Linux 側は `notify-send` で表示し、同じ通知の更新は同じ吹き出しを置き換えます。スマホ側で通知を消す (アプリで開く、スワイプするなど) と、`gdbus` または `dbus-send` でデスクトップ側の吹き出しも閉じます。通知へのアクセスは Shizuku 経由で自動的に有効になるので、設定画面を開く必要はありません。
+- Linux 側に送るのは、ユーザーが消せる通知だけです。メディアプレイヤーやダウンロードなどの継続中の通知、グループの要約 (summary) は、重複やノイズを避けるため送りません。メディアは「再生中メディアの同期」で別に扱います。
+- Linux → スマホ: `busctl` でセッション bus の `org.freedesktop.Notifications` (`Notify` / `CloseNotification` / `NotificationClosed`) を監視し、デスクトップ通知を Android の通知として表示します。更新は同じ Android 通知を置き換え、デスクトップ側で閉じた通知や期限切れになった通知は Android 側でも消します。
+- 両方向とも、同期するのはタイトルと本文だけです。通知の操作ボタン (返信など) やアイコンは同期しません。
+- Bridge が表示した通知には D-Bus のヒント (`x-bridge-origin`) を付けて、Linux → スマホ → Linux のように往復しないようにしています。
 - 接続していない間に届いた通知は送りません。接続後に届いたものから同期します。
 
 ### 自動再接続
@@ -256,7 +258,9 @@ plugins += PingPlugin()
 | `Media: waiting for listener permission` (Last event) | 通知へのアクセス権がまだ有効になっていません。Shizuku が起動していれば自動で有効になります。ならない場合は設定の「通知へのアクセス」で Bridge を許可してください |
 | `Notifications: waiting for listener permission` | 同上。通知の同期に使う通知へのアクセス権がまだ有効になっていません |
 
-Linux側の動作は、デーモンのログ (`journalctl --user -u bridge`) で確認できます。クリップボードが変わるたびに `local clipboard changed` と `received clipboard from client`、通知が届くたびに `notification from ...` が出ます。
+Linux の通知がスマホに出ないときは、Android 13 以降で Bridge の通知権限が許可されているか確認してください。`busctl` が無い場合は、デーモンのログに `busctl not found: Linux notifications are not sent to the phone` が出ます。
+
+Linux側の動作は、デーモンのログ (`journalctl --user -u bridge`) で確認できます。クリップボードが変わるたびに `local clipboard changed` と `received clipboard from client`、スマホの通知が届くたびに `notification from ...`、Linux の通知をスマホに送るときに `local notification to phone: ...` が出ます。
 
 ## 制限事項
 
@@ -266,8 +270,10 @@ Linux側の動作は、デーモンのログ (`journalctl --user -u bridge`) で
 - シークの反映には最大で1.5秒ほどかかります。シークに対応していないプレイヤーでは、シークバーを動かしても反映されません。
 - 複数のプレイヤーが同時にあるとき、Linux側はどれを送るかを `playerctl` の既定の選び方に任せています (Android側は再生中のものを優先します)。
 - スマホが記憶できるペアリング先は1台です (Linux側は複数の端末を登録できます)。
-- 通知の同期はスマホ → Linux の一方向です。Linux側で消した通知はスマホ側には残ります。通知の操作ボタン、アイコン、返信には対応しません。
-- 継続中の通知 (メディア、ダウンロード、常駐サービスなど)、グループの要約、ユーザーが消せない通知は送りません。
+- 通知の同期は双方向ですが、同期するのはタイトルと本文だけです。通知の操作ボタン、アイコン、返信には対応しません。
+- スマホ → Linux では、継続中の通知 (メディア、ダウンロード、常駐サービスなど)、グループの要約、ユーザーが消せない通知は送りません。
+- Linux → スマホには `busctl` (systemd) と、通知を扱う D-Bus サービスが必要です。無い場合はスマホ → Linux 方向だけが動きます。
+- 接続前に出ていた通知は、どちらの方向でも接続後に送り直しません。
 - アプリ名は、Android のパッケージ可視性の制限で取得できない場合、パッケージ名のまま表示されます。
 - Android の内部クリップボード API はバージョンによって引数が違うため、型から引数を組み立てています。Android 14 以降の端末では、特に動作を確認してください。
 - 通信は IPv4 のみを想定しています。

@@ -43,6 +43,7 @@ class SyncService : Service() {
     private lateinit var discovery: Discovery
     private val plugins = mutableListOf<BridgePlugin>()
     private lateinit var media: MediaPlugin
+    private lateinit var notifications: NotificationPlugin
     private var loop: Job? = null
 
     // Cuts the retry wait short when the network changes
@@ -71,7 +72,8 @@ class SyncService : Service() {
         plugins += ClipboardPlugin(shizuku, scope)
         media = MediaPlugin(this, shizuku, scope)
         plugins += media
-        plugins += NotificationPlugin(this, shizuku, scope)
+        notifications = NotificationPlugin(this, shizuku, scope)
+        plugins += notifications
         watchNetwork()
     }
 
@@ -375,6 +377,7 @@ class SyncService : Service() {
         }
         scope.cancel()
         media.close()
+        notifications.close()
         shizuku.unbind()
         Status.connection = "stopped"
         super.onDestroy()
