@@ -28,7 +28,6 @@ import rikka.shizuku.Shizuku
 class MainActivity : Activity() {
 
     private lateinit var status: TextView
-    private lateinit var host: EditText
     private val handler = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private val discovery by lazy { Discovery(this) }
@@ -52,23 +51,10 @@ class MainActivity : Activity() {
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(pad, pad, pad, pad) }
 
         status = TextView(this)
-        host = EditText(this).apply {
-            hint = "Host override (optional, host or host:port)"
-            setText(Config.load(this@MainActivity).host)
-        }
 
         val pair = Button(this).apply {
             text = "Pair new device"
-            setOnClickListener {
-                val manual = host.text.toString().trim()
-                Config.saveHost(this@MainActivity, manual)
-                if (manual.isNotEmpty()) {
-                    val (h, p) = Config.parseHostPort(manual)
-                    askCode(h, p, h)
-                } else {
-                    showDeviceList()
-                }
-            }
+            setOnClickListener { showPairDialog() }
         }
         val grant = Button(this).apply {
             text = "Grant Shizuku permission"
@@ -77,7 +63,6 @@ class MainActivity : Activity() {
         val start = Button(this).apply {
             text = "Start"
             setOnClickListener {
-                Config.saveHost(this@MainActivity, host.text.toString().trim())
                 if (Config.load(this@MainActivity).pairing == null) {
                     Toast.makeText(this@MainActivity, "Pair a device first", Toast.LENGTH_SHORT).show()
                 } else {
@@ -93,21 +78,59 @@ class MainActivity : Activity() {
             }
         }
 
-        listOf(status, host, pair, grant, start, stop).forEach { root.addView(it) }
+        listOf(status, pair, grant, start, stop).forEach { root.addView(it) }
         setContentView(root)
     }
 
-    /** Lists daemons found on the network; tapping one asks for the pairing code. */
-    private fun showDeviceList() {
+    /**
+     * Pairing dialog: an optional host override plus the daemons found on the network.
+     * Typing an address and pressing "Pair" skips discovery; tapping a device uses it.
+     */
+    private fun showPairDialog() {
+        val pad = (16 * resources.displayMetrics.density).toInt()
         val found = mutableListOf<Found>()
         val labels = mutableListOf<String>()
         val adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, labels)
-        val list = ListView(this).apply { this.adapter = adapter }
+        val hostLabel = TextView(this).apply { text = "Host override (optional)" }
+        val hostInput = EditText(this).apply {
+            hint = "host or host:port"
+            setText(Config.load(this@MainActivity).host)
+        }
+        val list = ListView(this).apply {
+            this.adapter = adapter
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                (200 * resources.displayMetrics.density).toInt()
+            )
+        }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, pad / 2, pad, 0)
+            addView(hostLabel)
+            addView(hostInput)
+            addView(list)
+        }
         val dialog = AlertDialog.Builder(this)
-            .setTitle("Searching for devices...")
-            .setView(list)
+            .setTitle("Pair new device")
+            .setView(content)
+            .setPositiveButton("Pair", null)
             .setNegativeButton("Cancel", null)
             .create()
+
+        dialog.setOnShowListener {
+            // Keep the dialog open when there is nothing to pair with yet
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val manual = hostInput.text.toString().trim()
+                if (manual.isEmpty()) {
+                    Toast.makeText(this, "Enter a host or select a device", Toast.LENGTH_SHORT).show()
+                } else {
+                    Config.saveHost(this, manual)
+                    dialog.dismiss()
+                    val (h, p) = Config.parseHostPort(manual)
+                    askCode(h, p, h)
+                }
+            }
+        }
 
         val stop = discovery.scan { f ->
             runOnUiThread {
@@ -123,6 +146,8 @@ class MainActivity : Activity() {
         list.setOnItemClickListener { _, _, i, _ ->
             val f = found[i]
             dialog.dismiss()
+            // A discovered device is reachable at its announced address, so drop any stale override
+            Config.saveHost(this, "")
             askCode(f.host, f.port, f.name)
         }
         dialog.show()
