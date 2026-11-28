@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <string name="app_name">Bridge</string>
+    <string name="app_subtitle">Linux ↔ Android</string>
+
+    <string name="status_title">Status</string>
+    <string name="status_connection">Connection</string>
+    <string name="status_paired">Paired device</string>
+    <string name="status_shizuku">Shizuku</string>
+    <string name="status_shizuku_service">Shizuku service</string>
+    <string name="status_retry">Next retry</string>
+    <string name="status_media">Media</string>
+    <string name="status_notifications">Notifications</string>
+    <string name="status_last_event">Last event</string>
+    <string name="status_not_paired">not paired</string>
+    <string name="status_unnamed">(unnamed)</string>
+    <string name="status_bound">bound</string>
+    <string name="status_not_bound">not bound</string>
+    <string name="status_none">-</string>
+
+    <string name="shizuku_not_running">not running</string>
+    <string name="shizuku_permission_not_granted">permission not granted</string>
+    <string name="shizuku_ready">ready</string>
+
+    <string name="actions_title">Actions</string>
+    <string name="pair_new_device">Pair new device</string>
+    <string name="grant_shizuku">Grant Shizuku permission</string>
+    <string name="start">Start</string>
+    <string name="stop">Stop</string>
+    <string name="pair_first">Pair a device first</string>
+    <string name="footer_hint">Bridge keeps syncing in the background while the service is running.</string>
+
+    <string name="pair_select_device">Select a device</string>
+    <string name="pair_host_hint">Host override (optional)</string>
+    <string name="pair_host_helper">Leave empty to discover devices on your network</string>
+    <string name="pair_devices_title">Devices on your network</string>
+    <string name="pair_searching">Searching for devices…</string>
+    <string name="pair_enter_host_or_select">Enter a host or select a device</string>
+    <string name="pair_button">Pair</string>
+    <string name="cancel">Cancel</string>
+    <string name="pair_with">Pair with %1$s</string>
+    <string name="pair_code_message" tools:ignore="TypographyDashes">Enter the code shown on the Linux screen. If no code is shown, run: bridge_daemon.py --pair</string>
+    <string name="pair_code_hint">Pairing code</string>
+    <string name="pair_code_required">Enter the pairing code</string>
+    <string name="pairing">Pairing…</string>
+    <string name="paired_with">Paired with %1$s</string>
+    <string name="pairing_failed">Pairing failed: %1$s</string>
+    <string name="pair_device_address">%1$s:%2$d</string>
+</resources>

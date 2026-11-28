@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.Bridge" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/bridge_primary</item>
+        <item name="colorOnPrimary">@color/bridge_on_primary</item>
+        <item name="colorPrimaryContainer">@color/bridge_primary_container</item>
+        <item name="colorOnPrimaryContainer">@color/bridge_on_primary_container</item>
+        <item name="colorSecondary">@color/bridge_secondary</item>
+        <item name="colorOnSecondary">@color/bridge_on_secondary</item>
+        <item name="colorSecondaryContainer">@color/bridge_secondary_container</item>
+        <item name="colorOnSecondaryContainer">@color/bridge_on_secondary_container</item>
+        <item name="colorTertiary">@color/bridge_tertiary</item>
+        <item name="colorOnTertiary">@color/bridge_on_tertiary</item>
+        <item name="colorTertiaryContainer">@color/bridge_tertiary_container</item>
+        <item name="colorOnTertiaryContainer">@color/bridge_on_tertiary_container</item>
+        <item name="colorError">@color/bridge_error</item>
+        <item name="colorOnError">@color/bridge_on_error</item>
+        <item name="colorErrorContainer">@color/bridge_error_container</item>
+        <item name="colorOnErrorContainer">@color/bridge_on_error_container</item>
+        <item name="android:colorBackground">@color/bridge_background</item>
+        <item name="colorOnBackground">@color/bridge_on_background</item>
+        <item name="colorSurface">@color/bridge_surface</item>
+        <item name="colorOnSurface">@color/bridge_on_surface</item>
+        <item name="colorSurfaceVariant">@color/bridge_surface_variant</item>
+        <item name="colorOnSurfaceVariant">@color/bridge_on_surface_variant</item>
+        <item name="colorOutline">@color/bridge_outline</item>
+        <item name="colorOutlineVariant">@color/bridge_outline_variant</item>
+        <item name="colorSurfaceDim">@color/bridge_surface_dim</item>
+        <item name="colorSurfaceBright">@color/bridge_surface_bright</item>
+        <item name="colorSurfaceContainerLowest">@color/bridge_surface_container_lowest</item>
+        <item name="colorSurfaceContainerLow">@color/bridge_surface_container_low</item>
+        <item name="colorSurfaceContainer">@color/bridge_surface_container</item>
+        <item name="colorSurfaceContainerHigh">@color/bridge_surface_container_high</item>
+        <item name="colorSurfaceContainerHighest">@color/bridge_surface_container_highest</item>
+        <item name="colorSurfaceInverse">@color/bridge_inverse_surface</item>
+        <item name="colorOnSurfaceInverse">@color/bridge_inverse_on_surface</item>
+        <item name="colorPrimaryInverse">@color/bridge_inverse_primary</item>
+
+        <item name="android:windowBackground">@color/bridge_surface</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+
+    <style name="Widget.Bridge.Card" parent="Widget.Material3.CardView.Filled">
+        <item name="cardBackgroundColor">?attr/colorSurfaceContainer</item>
+        <item name="cardCornerRadius">20dp</item>
+        <item name="cardElevation">0dp</item>
+        <item name="strokeWidth">0dp</item>
+    </style>
+
+    <style name="TextAppearance.Bridge.StatusLabel" parent="TextAppearance.Material3.BodyMedium">
+        <item name="android:textColor">?attr/colorOnSurfaceVariant</item>
+    </style>
+
+    <style name="TextAppearance.Bridge.StatusValue" parent="TextAppearance.Material3.BodyMedium">
+        <item name="android:textColor">?attr/colorOnSurface</item>
+    </style>
+</resources>

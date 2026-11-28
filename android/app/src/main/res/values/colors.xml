@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Material 3 light palette (teal) -->
+    <color name="bridge_primary">#006A6A</color>
+    <color name="bridge_on_primary">#FFFFFF</color>
+    <color name="bridge_primary_container">#9CF1F0</color>
+    <color name="bridge_on_primary_container">#002020</color>
+    <color name="bridge_secondary">#4A6363</color>
+    <color name="bridge_on_secondary">#FFFFFF</color>
+    <color name="bridge_secondary_container">#CCE8E7</color>
+    <color name="bridge_on_secondary_container">#051F1F</color>
+    <color name="bridge_tertiary">#4B607C</color>
+    <color name="bridge_on_tertiary">#FFFFFF</color>
+    <color name="bridge_tertiary_container">#D3E4FF</color>
+    <color name="bridge_on_tertiary_container">#041C35</color>
+    <color name="bridge_error">#BA1A1A</color>
+    <color name="bridge_on_error">#FFFFFF</color>
+    <color name="bridge_error_container">#FFDAD6</color>
+    <color name="bridge_on_error_container">#410002</color>
+    <color name="bridge_background">#FAFDFC</color>
+    <color name="bridge_on_background">#191C1C</color>
+    <color name="bridge_surface">#FAFDFC</color>
+    <color name="bridge_on_surface">#191C1C</color>
+    <color name="bridge_surface_variant">#DAE5E4</color>
+    <color name="bridge_on_surface_variant">#3F4948</color>
+    <color name="bridge_outline">#6F7979</color>
+    <color name="bridge_outline_variant">#BEC9C8</color>
+    <color name="bridge_surface_dim">#D9DBDA</color>
+    <color name="bridge_surface_bright">#FAFDFC</color>
+    <color name="bridge_surface_container_lowest">#FFFFFF</color>
+    <color name="bridge_surface_container_low">#F4F7F6</color>
+    <color name="bridge_surface_container">#EEF1F0</color>
+    <color name="bridge_surface_container_high">#E8EBEA</color>
+    <color name="bridge_surface_container_highest">#E2E5E4</color>
+    <color name="bridge_inverse_surface">#2E3131</color>
+    <color name="bridge_inverse_on_surface">#EFF1F0</color>
+    <color name="bridge_inverse_primary">#80D5D4</color>
+
+    <!-- Status indicator -->
+    <color name="status_connected">#2E7D32</color>
+    <color name="status_pending">#A15C00</color>
+    <color name="status_error">#BA1A1A</color>
+    <color name="status_idle">#6F7979</color>
+</resources>

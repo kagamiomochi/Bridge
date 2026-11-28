@@ -1,23 +1,30 @@
 package dev.kagamimochi.bridge
 
 import android.Manifest
-import android.app.Activity
-import android.app.AlertDialog
+import android.content.DialogInterface
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.ColorStateList
+import android.content.res.Configuration
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.text.InputType
+import android.view.LayoutInflater
 import android.view.View
-import android.widget.ArrayAdapter
-import android.widget.Button
-import android.widget.EditText
-import android.widget.LinearLayout
+import android.view.ViewGroup
+import android.widget.BaseAdapter
 import android.widget.ListView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.annotation.ColorRes
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import com.google.android.material.button.MaterialButton
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.android.material.textfield.TextInputEditText
+import com.google.android.material.textfield.TextInputLayout
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -26,17 +33,26 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import rikka.shizuku.Shizuku
 
-class MainActivity : Activity() {
+class MainActivity : AppCompatActivity() {
 
-    private lateinit var status: TextView
-    private lateinit var grant: Button
+    private lateinit var statusDot: View
+    private lateinit var connectionValue: TextView
+    private lateinit var pairedValue: TextView
+    private lateinit var shizukuValue: TextView
+    private lateinit var shizukuServiceValue: TextView
+    private lateinit var retryValue: TextView
+    private lateinit var mediaValue: TextView
+    private lateinit var notificationsValue: TextView
+    private lateinit var lastEventValue: TextView
+    private lateinit var grant: MaterialButton
+
     private val handler = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private val discovery by lazy { Discovery(this) }
 
     private val permListener = Shizuku.OnRequestPermissionResultListener { _, _ -> refresh() }
 
-    // Refresh the status text once per second
+    // Refresh the status once per second
     private val ticker = object : Runnable {
         override fun run() {
             refresh()
@@ -46,42 +62,43 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        // The app draws edge-to-edge, so match the system bar icons to the theme
+        val isNight = (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+            Configuration.UI_MODE_NIGHT_YES
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            isAppearanceLightStatusBars = !isNight
+            isAppearanceLightNavigationBars = !isNight
+        }
+
+        statusDot = findViewById(R.id.statusDot)
+        connectionValue = findViewById(R.id.connectionValue)
+        pairedValue = findViewById(R.id.pairedValue)
+        shizukuValue = findViewById(R.id.shizukuValue)
+        shizukuServiceValue = findViewById(R.id.shizukuServiceValue)
+        retryValue = findViewById(R.id.retryValue)
+        mediaValue = findViewById(R.id.mediaValue)
+        notificationsValue = findViewById(R.id.notificationsValue)
+        lastEventValue = findViewById(R.id.lastEventValue)
+        grant = findViewById(R.id.grantButton)
+
         requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 0)
         Shizuku.addRequestPermissionResultListener(permListener)
 
-        val pad = (16 * resources.displayMetrics.density).toInt()
-        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(pad, pad, pad, pad) }
-
-        status = TextView(this)
-
-        val pair = Button(this).apply {
-            text = "Pair new device"
-            setOnClickListener { showPairDialog() }
-        }
-        grant = Button(this).apply {
-            text = "Grant Shizuku permission"
-            setOnClickListener { if (Shizuku.pingBinder()) Shizuku.requestPermission(0) }
-        }
-        val start = Button(this).apply {
-            text = "Start"
-            setOnClickListener {
-                if (Config.load(this@MainActivity).pairing == null) {
-                    Toast.makeText(this@MainActivity, "Pair a device first", Toast.LENGTH_SHORT).show()
-                } else {
-                    restartService()
-                }
+        findViewById<MaterialButton>(R.id.pairButton).setOnClickListener { showPairDialog() }
+        grant.setOnClickListener { if (Shizuku.pingBinder()) Shizuku.requestPermission(0) }
+        findViewById<MaterialButton>(R.id.startButton).setOnClickListener {
+            if (Config.load(this@MainActivity).pairing == null) {
+                Toast.makeText(this@MainActivity, R.string.pair_first, Toast.LENGTH_SHORT).show()
+            } else {
+                restartService()
             }
         }
-        val stop = Button(this).apply {
-            text = "Stop"
-            setOnClickListener {
-                Config.setServiceEnabled(this@MainActivity, false)
-                stopService(Intent(this@MainActivity, SyncService::class.java))
-            }
+        findViewById<MaterialButton>(R.id.stopButton).setOnClickListener {
+            Config.setServiceEnabled(this@MainActivity, false)
+            stopService(Intent(this@MainActivity, SyncService::class.java))
         }
-
-        listOf(status, pair, grant, start, stop).forEach { root.addView(it) }
-        setContentView(root)
     }
 
     /**
@@ -89,42 +106,29 @@ class MainActivity : Activity() {
      * Typing an address and pressing "Pair" skips discovery; tapping a device uses it.
      */
     private fun showPairDialog() {
-        val pad = (16 * resources.displayMetrics.density).toInt()
-        val found = mutableListOf<Found>()
-        val labels = mutableListOf<String>()
-        val adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, labels)
-        val hostLabel = TextView(this).apply { text = "Host override (optional)" }
-        val hostInput = EditText(this).apply {
-            hint = "host or host:port"
-            setText(Config.load(this@MainActivity).host)
-        }
-        val list = ListView(this).apply {
-            this.adapter = adapter
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                (200 * resources.displayMetrics.density).toInt()
-            )
-        }
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(pad, pad / 2, pad, 0)
-            addView(hostLabel)
-            addView(hostInput)
-            addView(list)
-        }
-        val dialog = AlertDialog.Builder(this)
-            .setTitle("Pair new device")
+        val content = layoutInflater.inflate(R.layout.dialog_pair, null)
+        val hostInput = content.findViewById<TextInputEditText>(R.id.hostInput)
+        val list = content.findViewById<ListView>(R.id.deviceList)
+        val emptyView = content.findViewById<TextView>(R.id.emptyView)
+        hostInput.setText(Config.load(this).host)
+
+        val adapter = DeviceAdapter()
+        list.adapter = adapter
+        list.emptyView = emptyView
+
+        val dialog = MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.pair_new_device)
             .setView(content)
-            .setPositiveButton("Pair", null)
-            .setNegativeButton("Cancel", null)
+            .setPositiveButton(R.string.pair_button, null)
+            .setNegativeButton(R.string.cancel, null)
             .create()
 
         dialog.setOnShowListener {
             // Keep the dialog open when there is nothing to pair with yet
-            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                val manual = hostInput.text.toString().trim()
+            dialog.getButton(DialogInterface.BUTTON_POSITIVE).setOnClickListener {
+                val manual = hostInput.text?.toString()?.trim().orEmpty()
                 if (manual.isEmpty()) {
-                    Toast.makeText(this, "Enter a host or select a device", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, R.string.pair_enter_host_or_select, Toast.LENGTH_SHORT).show()
                 } else {
                     Config.saveHost(this, manual)
                     dialog.dismiss()
@@ -136,17 +140,15 @@ class MainActivity : Activity() {
 
         val stop = discovery.scan { f ->
             runOnUiThread {
-                if (found.none { it.name == f.name }) {
-                    found += f
-                    labels += "${f.name}  (${f.host})"
-                    adapter.notifyDataSetChanged()
-                    dialog.setTitle("Select a device")
+                if (!isFinishing && !isDestroyed && adapter.items.none { it.name == f.name }) {
+                    adapter.add(f)
+                    dialog.setTitle(R.string.pair_select_device)
                 }
             }
         }
         dialog.setOnDismissListener { stop() }
-        list.setOnItemClickListener { _, _, i, _ ->
-            val f = found[i]
+        list.setOnItemClickListener { _, _, position, _ ->
+            val f = adapter.getItem(position)
             dialog.dismiss()
             // A discovered device is reachable at its announced address, so drop any stale override
             Config.saveHost(this, "")
@@ -156,23 +158,34 @@ class MainActivity : Activity() {
     }
 
     private fun askCode(host: String, port: Int, name: String) {
-        val input = EditText(this).apply {
-            hint = "XXXX-XXXX"
-            inputType = InputType.TYPE_CLASS_TEXT or
-                InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS or
-                InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        val content = layoutInflater.inflate(R.layout.dialog_code, null)
+        val codeLayout = content.findViewById<TextInputLayout>(R.id.codeLayout)
+        val codeInput = content.findViewById<TextInputEditText>(R.id.codeInput)
+
+        val dialog = MaterialAlertDialogBuilder(this)
+            .setTitle(getString(R.string.pair_with, name))
+            .setView(content)
+            .setPositiveButton(R.string.pair_button, null)
+            .setNegativeButton(R.string.cancel, null)
+            .create()
+
+        dialog.setOnShowListener {
+            // Keep the dialog open so a missing code can be reported inline
+            dialog.getButton(DialogInterface.BUTTON_POSITIVE).setOnClickListener {
+                val code = codeInput.text?.toString().orEmpty()
+                if (code.isBlank()) {
+                    codeLayout.error = getString(R.string.pair_code_required)
+                } else {
+                    dialog.dismiss()
+                    doPair(host, port, name, code)
+                }
+            }
         }
-        AlertDialog.Builder(this)
-            .setTitle("Pair with $name")
-            .setMessage("Enter the code shown on the Linux screen. If no code is shown, run: bridge_daemon.py --pair")
-            .setView(input)
-            .setPositiveButton("Pair") { _, _ -> doPair(host, port, name, input.text.toString()) }
-            .setNegativeButton("Cancel", null)
-            .show()
+        dialog.show()
     }
 
     private fun doPair(host: String, port: Int, name: String, code: String) {
-        Toast.makeText(this, "Pairing...", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, R.string.pairing, Toast.LENGTH_SHORT).show()
         scope.launch {
             val result = withContext(Dispatchers.IO) {
                 PairingClient.pair(host, port, name, code, Build.MODEL)
@@ -180,9 +193,17 @@ class MainActivity : Activity() {
             result.onSuccess {
                 Config.savePairing(this@MainActivity, it)
                 restartService()
-                Toast.makeText(this@MainActivity, "Paired with $name", Toast.LENGTH_SHORT).show()
+                Toast.makeText(
+                    this@MainActivity,
+                    getString(R.string.paired_with, name),
+                    Toast.LENGTH_SHORT
+                ).show()
             }.onFailure {
-                Toast.makeText(this@MainActivity, "Pairing failed: ${it.message}", Toast.LENGTH_LONG).show()
+                Toast.makeText(
+                    this@MainActivity,
+                    getString(R.string.pairing_failed, it.message ?: it.javaClass.simpleName),
+                    Toast.LENGTH_LONG
+                ).show()
             }
         }
     }
@@ -197,24 +218,75 @@ class MainActivity : Activity() {
         val permissionGranted = Shizuku.pingBinder() &&
             Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
         grant.visibility = if (permissionGranted) View.GONE else View.VISIBLE
+
         val shizuku = when {
-            !Shizuku.pingBinder() -> "not running"
-            !permissionGranted -> "permission not granted"
-            else -> "ready"
+            !Shizuku.pingBinder() -> getString(R.string.shizuku_not_running)
+            !permissionGranted -> getString(R.string.shizuku_permission_not_granted)
+            else -> getString(R.string.shizuku_ready)
         }
-        val paired = Config.load(this).pairing?.serverName?.ifEmpty { "(unnamed)" } ?: "not paired"
-        status.text = "Paired with: $paired\n" +
-            "Shizuku: $shizuku\n" +
-            "Shizuku service: ${if (Status.shizukuServiceBound) "bound" else "not bound"}\n" +
-            "Connection: ${Status.connection}\n" +
-            "Next retry: ${Status.retry.ifEmpty { "-" }}\n" +
-            "Media: ${Status.media}\n" +
-            "Notifications: ${Status.notifications}\n" +
-            "Last event: ${Status.lastEvent}"
+        val paired = Config.load(this).pairing?.serverName?.ifEmpty {
+            getString(R.string.status_unnamed)
+        } ?: getString(R.string.status_not_paired)
+
+        val connection = Status.connection
+        connectionValue.setIfChanged(connection)
+        statusDot.backgroundTintList = ColorStateList.valueOf(
+            ContextCompat.getColor(this, statusColor(connection))
+        )
+        pairedValue.setIfChanged(paired)
+        shizukuValue.setIfChanged(shizuku)
+        shizukuServiceValue.setIfChanged(
+            getString(if (Status.shizukuServiceBound) R.string.status_bound else R.string.status_not_bound)
+        )
+        retryValue.setIfChanged(Status.retry.ifEmpty { getString(R.string.status_none) })
+        mediaValue.setIfChanged(Status.media)
+        notificationsValue.setIfChanged(Status.notifications)
+        lastEventValue.setIfChanged(Status.lastEvent)
+    }
+
+    @ColorRes
+    private fun statusColor(connection: String): Int = when {
+        connection.startsWith("connected") -> R.color.status_connected
+        connection.startsWith("failed") || connection.startsWith("closed") -> R.color.status_error
+        connection.startsWith("connecting") ||
+            connection.startsWith("searching") ||
+            connection.startsWith("secure") ||
+            connection.startsWith("Linux shut down") -> R.color.status_pending
+        else -> R.color.status_idle
+    }
+
+    private fun TextView.setIfChanged(value: CharSequence) {
+        if (text.toString() != value.toString()) text = value
+    }
+
+    private inner class DeviceAdapter : BaseAdapter() {
+        val items = mutableListOf<Found>()
+        private val inflater = LayoutInflater.from(this@MainActivity)
+
+        fun add(found: Found) {
+            items += found
+            notifyDataSetChanged()
+        }
+
+        override fun getCount(): Int = items.size
+
+        override fun getItem(position: Int): Found = items[position]
+
+        override fun getItemId(position: Int): Long = position.toLong()
+
+        override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+            val view = convertView ?: inflater.inflate(R.layout.item_device, parent, false)
+            val found = getItem(position)
+            view.findViewById<TextView>(R.id.deviceName).text = found.name
+            view.findViewById<TextView>(R.id.deviceHost).text =
+                getString(R.string.pair_device_address, found.host, found.port)
+            return view
+        }
     }
 
     override fun onResume() {
         super.onResume()
+        handler.removeCallbacks(ticker)
         handler.post(ticker)
     }
 
@@ -224,6 +296,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        handler.removeCallbacks(ticker)
         scope.cancel()
         Shizuku.removeRequestPermissionResultListener(permListener)
         super.onDestroy()
